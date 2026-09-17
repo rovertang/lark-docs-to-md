@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lark Docx to Markdown"
+  short_description: "Export Lark Docx/Wiki docs to offline Markdown with images"
+  default_prompt: "Use $lark-docs-to-md to download this Feishu Docx or Wiki URL as offline Markdown with local images."
