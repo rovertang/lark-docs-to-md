@@ -280,4 +280,8 @@ python3 web/lark_download_web.py --port 8765                  # Web 服务
 
 ## License
 
-沿用原仓库的 `To be decided`——尚未选定许可证，等你决定后再补 `LICENSE` 文件与 `SKILL.md` 的 `license` 字段（该字段可选，留空不影响任何 Agent 加载）。
+[MIT](LICENSE) © 2026 RoverTang
+
+选择 MIT 的原因：这个仓库的定位是"给人用、也给 Agent 装的工具"，MIT 是最宽松、最通用、附加条件最少的许可——允许任何人不带负担地复制、修改、商用、再分发，也能被放进闭源项目；它兼容几乎所有下游许可，不需要像 GPL 那样传递传染性，也不需要像 Apache-2.0 那样附带 NOTICE 文件维护义务。对脚本 + skill 这种希望被到处引用、被 Agent 自动抓取安装的项目，MIT 的分发阻力最小。
+
+`SKILL.md` 的 `license` 字段已同步为 `MIT`（该字段在 Agent Skills 规范与各 Agent 的白名单内，可安全保留）。

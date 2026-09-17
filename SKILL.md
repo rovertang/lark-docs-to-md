@@ -3,6 +3,7 @@ name: lark-docs-to-md
 description: "Download Feishu/Lark Docx or Wiki documents as offline Markdown with local images - single URL, URL-list batch, or recursive child documents - and optionally serve a bundled local web UI for the same job. Use when the user provides feishu.cn / larksuite.com / docx/ or /wiki/ URLs and asks to download, archive, export, mirror, or batch-download them, including 批量下载飞书文档, 导出飞书文档为 Markdown, 递归下载子文档, 下载文档图片. Not for legacy docs, sheets, Base, attachments, or whiteboards."
 metadata:
   short-description: "Export Lark Docx/Wiki documents to offline Markdown"
+license: MIT
 ---
 
 # Lark Docx to Markdown
