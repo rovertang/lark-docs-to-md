@@ -1,14 +1,16 @@
 # lark-docs-to-md
 
+**版本 1.2.0**（见 [`VERSION`](VERSION) 与 [`CHANGELOG.md`](CHANGELOG.md)）。
+
 把飞书 / Lark 的 **Docx**、**Wiki** 文档批量导出成本地 **Markdown**（含图片），并用同一个内核提供三种用法：
 
 | 用法 | 入口 | 适合谁 |
 | --- | --- | --- |
-| 命令行脚本 | `scripts/download_docx_tree.py`、`scripts/batch_download.py` | 想写进定时任务、CI、自己拼命令的人 |
+| 命令行脚本 | `scripts/download_docx_tree.py`、`scripts/batch_download.py`、`scripts/download_wiki_space.py` | 想写进定时任务、CI、自己拼命令的人 |
 | 本地 Web 服务 | `web/lark_download_web.py`（单文件、零依赖） | 想打开浏览器、粘贴链接、点按钮下载的人 |
 | Agent Skill | `SKILL.md`（本仓库根目录就是 skill 目录） | Codex / Claude Code / DeepSeek Harness / OpenClaw / Hermes 等 Agent |
 
-三种用法共用同一套脚本：Web 服务不会另写一份下载逻辑，它用 `subprocess` 调用 `scripts/download_docx_tree.py`，并直接复用其中的 URL 解析、文件名清洗和 manifest 读取函数。**仓库里只有一份下载实现，不存在版本分叉。**
+三种用法共用同一套脚本：Web 服务不会另写一份下载逻辑，它用 `subprocess` 调用 `scripts/download_docx_tree.py`，并直接复用其中的 URL 解析、文件名清洗和 manifest 读取函数；整库导出脚本 `scripts/download_wiki_space.py` 同样复用 `download_tree()` 与 `run_lark_cli()`。**仓库里只有一份下载实现，不存在版本分叉。**
 
 ---
 
@@ -18,13 +20,16 @@
 lark-docs-to-md/                 # 仓库根目录 == skill 目录（folder 名必须等于 SKILL.md 的 name）
 ├── SKILL.md                     # Agent Skill 定义（可移植 frontmatter）
 ├── README.md                    # 本文件（人读；对 Agent 发现 skill 无影响）
+├── CHANGELOG.md                 # 版本变更记录（Keep a Changelog 风格）
+├── VERSION                      # 单行版本号，check_env.py --version 读它
 ├── agents/openai.yaml           # Codex 专用的 UI 元数据（可选，缺失也不影响运行）
 ├── references/                  # 按需加载的参考文档（Agent 渐进披露）
 │   ├── agent-install.md         #   各 Agent 的 skill 目录与安装方式
 │   ├── troubleshooting.md       #   登录/权限/图片/Windows/WSL 排错
 │   └── output-format.md         #   Markdown 转换规则与 manifest 字段
 ├── scripts/
-│   ├── download_docx_tree.py    # 单文档 / 递归下载（核心）
+│   ├── download_docx_tree.py    # 单文档 / 递归下载（核心；被其他脚本复用）
+│   ├── download_wiki_space.py   # 整库导出：遍历 wiki 节点树并镜像目录结构（新增）
 │   ├── batch_download.py        # URL 列表批量下载
 │   ├── check_env.py             # 环境自检 + 登录引导（新增）
 │   ├── install_skill.py         # 一键安装到各 Agent 的 skill 目录（新增）
@@ -75,11 +80,12 @@ python3 scripts/check_env.py --login          # 打印链接 + 二维码，然�
 
 说明与注意点：
 
-- 默认申请 `docs` 域权限，也就是下载文档所需的最小集合；确有需要再用 `--domain` 追加。
+- 默认申请 `docs,wiki,drive,sheets` 四个域：`docs` 覆盖 Docx 导出，`wiki` 覆盖知识库节点树遍历，`drive` 覆盖附件下载/预览，`sheets` 覆盖电子表格 CSV 导出。整库导出（`download_wiki_space.py`）四个都要用到；确有需要再用 `--domain` 追加或收窄。
 - Token 由 `lark-cli` 保存，本项目的任何脚本**都不读取、不打印、不落盘** token。
 - Device code 约 **10 分钟**过期；过期就重新跑一次 `--login` 拿新链接，不需要重装任何东西。
 - 用户 token 的 refresh token 也会过期（本机实测遇到过 `missing (refresh token expired)`），此时同样只需重新 `--login`。
 - 需要机器人身份时加 `--identity bot`，但只有在该机器人对所有目标文档都有权限时才有意义；**用户自己的文档请用 `user`**。
+- 旧版 `doc` 节点的纯文本接口还需要一个默认域集合之外的 scope。缺少时脚本会直接打印修复命令：`当前登录缺少该接口所需 scope，重新授权即可：python3 scripts/check_env.py --login --domain docs,wiki,drive,sheets`。这类失败只影响旧版文档，其余类型照常导出。
 
 ### 3. 下载
 
@@ -92,13 +98,20 @@ python3 scripts/download_docx_tree.py "https://xxx.feishu.cn/docx/<token>" -o ./
 
 # 多个独立链接（每行一个 URL，支持 # 注释和空行）
 python3 scripts/batch_download.py -f ./urls.txt -o ./downloads
+
+# 整个知识库（wiki 空间）：遍历节点树，镜像分类目录并导出所有节点类型
+python3 scripts/download_wiki_space.py --space-id <SPACE_ID> -o ./downloads
+python3 scripts/download_wiki_space.py --space-id <SPACE_ID> --node-token <wikcn...> -o ./downloads
+python3 scripts/download_wiki_space.py --space-id <SPACE_ID> --dry-run          # 只看计划不下载
 ```
 
-输出固定在 `<输出目录>/<根文档 token>/` 下：Markdown 用文档真实标题命名，图片进 `assets/`（递归模式下为 `assets/<token>/`），结果摘要写入 `_download-manifest.json`。
+单文档/批量输出固定在 `<输出目录>/<根文档 token>/` 下：Markdown 用文档真实标题命名，图片进 `assets/`（递归模式下为 `assets/<token>/`），结果摘要写入 `_download-manifest.json`。
+
+整库导出输出在 `<输出目录>/<空间名>/` 下，按 wiki 层级镜像目录，并额外生成 `_INDEX.md`（分类层级 + 状态徽标 + 本地相对链接）、`_failures.md`（失败/降级/空/不支持/已跳过）、`_manifest.json`、`_manifest.csv`（UTF-8 带 BOM，Excel 可直接打开）；加 `--resume` 时再写一份 `state.json`。细节见 [`references/output-format.md`](references/output-format.md)。
 
 ---
 
-## Web 服务（浏览器里下载，支持批量）
+## Web 服务（浏览器里下载，支持批量与整库）
 
 ```bash
 python3 web/lark_download_web.py                 # 默认 http://127.0.0.1:8765/
@@ -107,7 +120,10 @@ python3 web/lark_download_web.py --output-dir ~/Downloads/lark
 ```
 
 - **零依赖**：只用 Python 标准库 + 内嵌前端，`python3 web/lark_download_web.py` 起来就能用，不需要 `pip install`、不需要 Node 构建。
-- **页面功能**：粘贴多个链接（一行一个，也支持直接粘贴一个 `urls.txt` 的**路径**）、递归开关、身份、输出目录、重试、超时、文档数上限；实时日志；每个 URL 的成功/失败卡片；文件列表与 Markdown 预览；一键打包 ZIP。
+- **两种模式**（页面顶部切换）：
+  - **文档链接**：粘贴多个链接（一行一个，也支持直接粘贴一个 `urls.txt` 的**路径**）、递归开关、输出目录、重试、超时、文档数上限。
+  - **知识库空间**：填 `space_id`（可选填某个 `wikcn…` 节点只导子树）、附件策略 `original/preview/skip`、并发数、节点类型过滤、`--resume` / `--flat` 开关、最大节点数——等价于 `download_wiki_space.py` 的常用参数。
+- 实时日志（含 `[title-fallback]` / `[empty]` / 节点级进度）、每个文档或空间的状态卡片（成功/降级/空/失败、图片数、标题回退数）、文件列表与文本预览（Markdown/CSV/HTML）、一键打包 ZIP。
 - **登录面板**：页面顶部显示当前环境与登录状态，点「授权登录」直接给出授权链接和二维码，授权完成点「我已完成授权」即收尾，全程不用切终端。
 - **安全**：默认只监听 `127.0.0.1`，因为服务会以当前登录用户的身份执行 `lark-cli`。绑定非回环地址必须显式加 `--allow-remote`，请只在可信网络下使用。
 - 任务只存在内存里，服务重启即清空；文件预览/ZIP 做了目录逃逸校验，只允许访问该任务输出目录内的文件。
@@ -137,17 +153,23 @@ python3 web/lark_download_web.py --output-dir ~/Downloads/lark
    https://rovertang.feishu.cn/docx/Qj58dcHFAoOcOVx5l7mcEK5Hnjb
    https://rovertang.feishu.cn/docx/Dwhudsgy8oKOUmx03AXcHiX8nvg
    https://rovertang.feishu.cn/docx/X7nndBYZRoC3MJxQKd7c7B71nhh
+   再跑一次整库导出的计划态验证（不下载、不写文件）：
+   python3 scripts/download_wiki_space.py --space-id <SPACE_ID> --dry-run --max-nodes 20
 5. 报告：绝对输出目录、成功文档数、图片数、失败 URL 及原因、退出码。
    任何图片失败都视为未完整下载，不要声称"全部完成"。
+   标题回退（`title_fallback`）和空文档（`empty`）只是警告，退出码仍为 0，
+   不要把这两种情况报成失败。
 ```
 
 Agent 端需要知道的约定（已写进 `SKILL.md` 与 `references/`）：
 
 - **先自检再下载**：`check_env.py` 的退出码就是决策依据，不要靠猜。
-- **不重写逻辑**：一律调用 `scripts/` 里的脚本；Web 服务同理，它是子进程调用同一个脚本。
+- **不重写逻辑**：一律调用 `scripts/` 里的脚本；Web 服务同理，它是子进程调用同一个脚本；整库导出也复用 `download_tree()`。
 - **不碰 token**：任何情况下都不打印、不复制、不写入 token；授权只走 `--login` / `--device-code`。
-- **如实汇报**：退出码 `1` 或存在 `image_failures` 时必须说"未完整"，并给出失败 URL；详情读 `_download-manifest.json`。
+- **如实汇报**：退出码 `1` 或存在 `image_failures` 时必须说"未完整"，并给出失败 URL；详情读 `_download-manifest.json`（整库导出读 `_manifest.json` 与 `_failures.md`）。
+- **分清失败与警告**：`title_fallback` / `empty` / 预览件 `partial` 不是下载失败，但要在报告里如实说明；`download_wiki_space.py` 的退出码独立为 `0`/`1`/`2`。
 - **递归要克制**：只有用户明确要求下载子文档时才加 `--recursive`，并建议配 `--max-docs`。
+- **整库导出同样要克制**：先 `--dry-run` 看规模，大空间加 `--max-nodes` 与 `--resume`，`--workers` 保持默认 4。
 
 ### 各 Agent 的安装位置
 
@@ -183,6 +205,7 @@ python3 scripts/install_skill.py --project /path/to/repo            # 装到某�
 | Python | 3.10+ | 所有脚本与 Web 服务（仅标准库） | 系统包管理器 / python.org |
 | Node.js | 18+ | 仅用于安装 `lark-cli` | nvm / fnm / 官方安装包 |
 | lark-cli | 1.0.x | 实际调用飞书开放接口 | `npm install -g @larksuite/cli` |
+| 飞书授权域 | `docs,wiki,drive,sheets` | `--login` 的默认申请集合：Docx 导出、wiki 节点树、附件下载、表格导出；旧版 `doc` 纯文本接口还需额外 scope | `python3 scripts/check_env.py --login` |
 
 **没有 Python 第三方依赖**，不需要 `pip install`、不需要虚拟环境、不需要 `package.json`。
 
@@ -216,7 +239,28 @@ python3 scripts/install_skill.py --project /path/to/repo            # 装到某�
 
 `batch_download.py`：`-f/--urls-file`（默认脚本旁的 `document_urls.txt`）、`-o/--output-dir`，其余同上。它按列表顺序逐个调用 `download_docx_tree.py`，**不递归**，单个失败会继续，最后统一汇总。
 
-`check_env.py`：`--json`、`--login`、`--no-wait`、`--device-code`、`--domain`、`--identity`、`--output-dir`、`--lark-cli`、`--timeout`。
+`download_wiki_space.py`（整库导出）：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--space-id ID` | 必填 | wiki 空间 ID，可用 `lark-cli wiki +space-list` 查看 |
+| `--node-token TOKEN` | 空 | 只导出该节点子树（`wikcn...` 节点 token），不传则遍历整个空间 |
+| `-o, --output-dir DIR` | 当前工作目录 | 父目录，内容落在 `DIR/<空间名>/` |
+| `--space-name NAME` | 自动探测 | 覆盖探测到的空间名（决定输出目录名） |
+| `--types a,b,c` | 全部已知类型 | 逗号分隔的节点类型白名单 |
+| `--attachments original\|preview\|skip` | `original` | 附件策略：原件（被拒时回退预览）/ 只取预览 / 跳过 |
+| `--workers N` | `4` | 并行节点数；飞书接口有频率限制，调大反而会间歇性失败（最小 1） |
+| `--max-nodes N` | `0`（不限） | 遍历节点数上限，触发即视为提前停止 |
+| `--resume` | 关 | 复用 `state.json`，跳过已完成（`ok`/`empty`/`unsupported`/`skipped`）节点，失败与降级节点重试 |
+| `--flat` | 关 | 不镜像层级，全部放进一个目录 |
+| `--dry-run` | 关 | 只遍历并打印计划，不下载 |
+| `-i, --identity user\|bot` | `user` | 调用 `lark-cli` 的身份 |
+| `--retries N` | `2` | 失败重试次数 |
+| `--timeout SECONDS` | `120` | 单次请求超时 |
+| `--doc-host HOST` | `feishu.cn` | 拼 wiki URL 时用的主机名 |
+| `--lark-cli PATH` | `lark-cli` | 指定可执行文件，亦可用环境变量 `LARK_CLI` |
+
+`check_env.py`：`--json`、`--login`、`--no-wait`、`--device-code`、`--domain`（默认 `docs,wiki,drive,sheets`）、`--identity`、`--output-dir`、`--lark-cli`、`--timeout`、`--version`。
 
 `install_skill.py`：`--targets`、`--all`、`--copy`、`--project`、`--project-only`、`--name`、`--force`、`--dry-run`、`--json`。
 
@@ -225,6 +269,8 @@ Web 服务：`--host`、`--port`、`--output-dir`、`--lark-cli`、`--identity`�
 ---
 
 ## 输出与退出码
+
+### 单文档 / 递归 / 批量（`download_docx_tree.py`、`batch_download.py`）
 
 ```text
 downloads/<根文档token>/
@@ -239,9 +285,47 @@ Markdown 会被规范化：`<title>` 转 H1、`<callout>` 降级为带 emoji 的
 
 | 退出码 | 含义 |
 | --- | --- |
-| `0` | 发现的文档和图片全部下载成功 |
+| `0` | 发现的文档和图片全部下载成功（含标题回退与空文档，它们只是警告） |
 | `1` | 部分失败，或触发 `--max-docs` 提前停止——**不要当作完整归档**，请读 manifest |
 | `2` | URL/参数非法，或输出目录读写失败 |
+
+**警告语义（1.2.0 修正）**：标题读不出来不再是失败。文件名按 `<title>` 元素 → `wiki +node-get` 节点元数据（wiki 文档）→ `drive +inspect` 文档元数据（docx 等，**一次轻量元数据调用，不是整篇重导**）→ 裸 token 的顺序回退，回退文件名为 `<token>.md`（不再带 `docx-`/`wiki-` 前缀），stderr 打印 `[title-fallback]` 并注明标题来源，manifest 记入 `title_fallbacks` / `title_fallback_count`（每条含 `source`：`wiki-node-get` / `drive-inspect` / `token`）。正文为空的文档同理：`[empty]` 打印、记入 `empty_documents` / `empty_count`、`documents[]` 里 `status: "empty"`，退出码仍为 `0`。汇总行形如：
+
+```text
+summary: output=... downloaded=N failed=N images=N image_failed=N title_fallback=N empty=N recursive=False limited=False
+```
+
+### 整库导出（`download_wiki_space.py`）
+
+```text
+<输出目录>/<空间名>/
+├── _INDEX.md          分类层级 + 状态徽标 + 本地相对路径链接
+├── _failures.md       失败 / 降级 / 空 / 不支持 / 已跳过，分组列出原因与飞书链接
+├── _manifest.json     机器可读，逐节点一条
+├── _manifest.csv      UTF-8 带 BOM，Excel 可直接打开
+├── state.json         仅 --resume 时写，记录已完成节点
+├── 财务管理制度/
+│   ├── _分类页.md                容器节点自身的正文
+│   ├── 博泰逾期应收款管理制度.docx
+│   ├── 收入确认财经要素V1.0.md
+│   ├── assets/收入确认财经要素V1.0/image-001.png
+│   └── PT IT-A0.01.OPR IT运维类制度/
+└── 网络安全管理制度.md
+```
+
+命名规则：非法字符 `/ \ : * ? " < > |` 与控制字符替换为 `_`，去掉首尾空格和点，长度上限 90 字符；空标题变成 `未命名-<node_token[:8]>`；同目录重名追加 `--<node_token[:10]>`；容器节点自身正文写进 `<目录>/_分类页.md`，因此 `<目录>/` 与 `<目录>.md` 不会同时出现。`_INDEX.md` 的链接使用 CommonMark 尖括号形式 `[标题](<路径>)`，因为真实文件名里含空格和半角 `)`；`_manifest.csv` 写成 UTF-8 **带 BOM**，避免 Excel 打开时中文乱码。
+
+各类型处理方式：`docx` → Markdown + 本地图片（复用 `download_tree()`，不存在第二份下载实现）；`doc`（旧版）→ `GET /open-apis/doc/v2/<obj_token>/raw_content` 纯文本，写成 `<名字>.md` 并在文件顶部显式警告全部格式（加粗、表格、图片、编号）已丢失，manifest 方法为 `legacy-raw-content`；`sheet` → 按可见子表各导出一个 CSV（取自 `data.annotated_csv`，隐藏子表跳过，单子表为 `<名字>.csv`，多子表为 `<名字>__<子表名>.csv`）；`file`（附件）→ `lark-cli drive +download` 取原件，被拒时回退 `drive +preview --list-only` 再按 `--type source_file|pdf|pdf_lin|html` 取预览，`source_file` 命中按真名保存为 `ok`，其他预览存成 `<名字>__preview.pdf` 并记为 `partial` / `fallback: "preview-<type>"`；`bitable`/`mindnote`/`slides`/`whiteboard` 与未知类型记为 `unsupported` 写进 `_failures.md`，不会被静默跳过。
+
+附件状态语义：`ok` 取到原件，`partial` 用预览件代替原件，`failed` 原件被拒且没有任何预览候选，`skipped` 由 `--attachments skip` 主动跳过。`--attachments preview` 会跳过取原件的步骤直接走预览链。
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 没有任何节点失败 |
+| `1` | 至少一个节点失败，或 `--max-nodes` 提前停止遍历 |
+| `2` | 参数非法，或一个可遍历的节点都没有 |
+
+`_manifest.json` 顶层字段：`version`、`space_id`、`space_name`、`root_node_token`、`output_dir`、`generated_at`、`flat`、`attachments`、`identity`、`complete`、`total_nodes`、`file_count`、`total_size_bytes`、`counts`（`ok`/`partial`/`empty`/`failed`/`unsupported`/`skipped`）、`limited`、`issues`、`nodes[]`；`nodes[]` 每条含 `node_token`、`obj_token`、`obj_type`、`title`、`path`（数组）、`depth`、`is_container`、`status`、`method`、`local_file`、`size_bytes`、`images`、`detail`、`url`，预览附件另有 `fallback`/`preview_type`，多子表工作簿另有 `files`。`complete` 仅在无节点失败且遍历未被截断时为 `true`。
 
 ---
 
@@ -256,7 +340,11 @@ Markdown 会被规范化：`<title>` 转 H1、`<callout>` 降级为带 emoji 的
 
 因此本仓库只保留**一份**权威副本放在 `scripts/`，不再保留第二份拷贝；skill 目录通过"仓库根目录即 skill 目录"的方式直接使用这份脚本，从机制上杜绝版本分叉。（`tmp/` 已由 `.gitignore` 忽略，仅作本地参考资料。）
 
-工作区里的这两份脚本与参考材料**逐字节一致**（上表 md5 即取自这些文件）；提交入库时由 `.gitattributes` 的 `* text=auto eol=lf` 统一规范为 LF 换行，**内容不变**，只是不再保留 CRLF。
+关于这两份脚本与上方基线的当前关系：
+
+- `scripts/batch_download.py` 仍然与参考材料**内容逐字节一致**：参考文件是 CRLF、仓库里由 `.gitattributes` 的 `* text=auto eol=lf` 统一为 LF，把参考文件去掉 CR 后的 md5 与工作区文件相同（`ac96f76de8eb5793f979e5d95838a85f`），差异只是换行符。
+- `scripts/download_docx_tree.py` **不再与基线逐字节一致**：它现在是基线的**超集**，承载了 P5/1.2.0 的缺陷修复与新能力（标题回退链、空文档、新的 manifest 字段与可复用函数 `run_lark_cli()` / `cli_error_details()` / `is_permission_error()` / `fetch_wiki_node_title()` / `fallback_document_title()`、`download_tree()` 的 `group_assets` 参数），完整清单见 [`CHANGELOG.md`](CHANGELOG.md)。退出码契约保持向后兼容，`title_failures` / `title_failed_count` 仍作为别名存在。
+- 新增的 `scripts/download_wiki_space.py` 没有对应的参考材料，它复用 `download_tree()` 与 `run_lark_cli()`，因此下载实现仍然只有一份。
 
 ---
 
@@ -264,19 +352,39 @@ Markdown 会被规范化：`<title>` 转 H1、`<callout>` 降级为带 emoji 的
 
 ```bash
 python3 -m py_compile scripts/*.py web/lark_download_web.py   # 语法检查
-python3 -m unittest discover -s scripts -p "test_*.py" -v     # 单元测试（6 项）
+python3 -m unittest discover -s scripts -p "test_*.py" -v     # 单元测试（含 test_download_wiki_space.py）
 python3 scripts/check_env.py --output-dir /tmp/x              # 环境自检
+python3 scripts/check_env.py --version                        # 读取 VERSION
 python3 scripts/install_skill.py --dry-run                    # skill 校验 + 安装预演
+python3 scripts/download_wiki_space.py --space-id X --dry-run # 整库导出计划态
 python3 web/lark_download_web.py --port 8765                  # Web 服务
 ```
 
-端到端实测（2026-09-18，用户身份授权后）：
+端到端实测（2026-09-18 / 1.2.0 复核 2026-09-21，均在用户身份授权后）：
 
 - 单文档下载：`Qj58dcHFAoOcOVx5l7mcEK5Hnjb` → `20260809宁波旅游规划.md`，exit 0。
 - 批量下载 3 个文档：全部成功，图片 25 + 4 张，`image_failed=0`。
+- 标题回退（1.2.0 修复验证）：`docx/X7nndBYZRoC3MJxQKd7c7B71nhh` 的 markdown 导出没有 `<title>`
+  （v1.1 靠整篇重导 XML 才拿到标题）→ 现在由 `drive +inspect` 元数据取回
+  `工程技术：在智能体优先的世界中利用 Codex.md`，`title_fallback=1`、`complete=True`、**exit 0**。
 - 递归模式：CLI `-r --max-docs 4` 正常执行（这 3 篇文档正文中没有 Docx/Wiki 子文档链接，因此未产生子文档）。
-- Web 服务：粘贴 URL 列表 → 任务 `ok=3`、预览正常、ZIP 打包 35 个文件、取消任务生效、目录逃逸请求返回 404。
-- Skill 安装：`~/.dsh/skills/lark-docs-to-md`（符号链接）被 DeepSeek Harness 立即识别并成功加载。
+- **整库导出**：`--space-id 7108212423034667011`（罗孚传说，5 个 docx 节点）→
+  `_INDEX.md` / `_failures.md` / `_manifest.json` / `_manifest.csv` 齐全，`ok=5 complete=True exit 0`；
+  嵌套层级用 `示例知识库`（10 节点、含 2 层容器）验证，容器正文正确落在 `<目录>/_分类页.md`。
+- **附件与表格**（用真实 token 定向验证）：`sheets +csv-get` 导出 `看房记录202609.csv`（`data.annotated_csv` 字段命中）；
+  `drive +download` 取回真实附件原件（52 KB）；无预览候选的类型正确落到 `failed` 分支。
+- **Web 服务**：文档模式批量任务 `ok=3`、预览/ZIP/取消/目录逃逸校验（404）全部通过；
+  知识库模式任务识别 `wiki-space://<id>`，`_INDEX.md`、`_manifest.csv`、文件列表与 ZIP 均正常。
+- Skill 安装：`~/.dsh/skills/lark-docs-to-md`（符号链接）被 DeepSeek Harness 立即识别并成功加载，
+  更新 `description` 后目录热更新生效。
+
+1.2.0 的缺陷修复与新特性由单元测试覆盖（`scripts/test_download_docx_tree.py` 14 项 +
+`scripts/test_download_wiki_space.py` 18 项 = 32 项，`python3 -m unittest discover -s scripts -p "test_*.py"` 全绿），
+包括标题回退（`drive-inspect` / 节点元数据 / 裸 token）、空文档写入但不影响退出码、
+重名子表不互相覆盖、`drive +download` 未落盘判失败、整库导出的命名与 manifest 断言。
+
+仍有限制：本机登录缺少旧版 `doc` 的 `raw_content` scope（`missing_scope`），
+因此**旧版 doc 的纯文本导出只做了 mock 测试**，未在本环境真实跑通；用它之前先确认 scope 已授权。
 
 ## License
 

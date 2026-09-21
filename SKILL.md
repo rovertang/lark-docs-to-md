@@ -1,8 +1,9 @@
 ---
 name: lark-docs-to-md
-description: "Download Feishu/Lark Docx or Wiki documents as offline Markdown with local images - single URL, URL-list batch, or recursive child documents - and optionally serve a bundled local web UI for the same job. Use when the user provides feishu.cn / larksuite.com / docx/ or /wiki/ URLs and asks to download, archive, export, mirror, or batch-download them, including 批量下载飞书文档, 导出飞书文档为 Markdown, 递归下载子文档, 下载文档图片. Not for legacy docs, sheets, Base, attachments, or whiteboards."
+description: "Download Feishu/Lark Docx or Wiki documents as offline Markdown with local images - single URL, URL-list batch, recursive child documents, or a whole wiki space (knowledge base) with legacy docs, spreadsheets and attachments. Includes a local web UI. Use when given feishu.cn / larksuite.com /docx/ or /wiki/ URLs or a wiki space id and asked to download, archive, export or mirror them, including 批量下载飞书文档, 导出飞书知识库, 递归下载子文档, 下载文档图片. Not for Base, mindnotes, slides or whiteboards."
 metadata:
   short-description: "Export Lark Docx/Wiki documents to offline Markdown"
+  version: "1.2.0"
 license: MIT
 ---
 
@@ -59,7 +60,30 @@ Several independent URLs (same as the web UI's list mode, no recursion):
 python3 scripts/batch_download.py --urls-file "<urls.txt>" --output-dir "<dir>"
 ```
 
-Web UI, when the user prefers a browser and wants to click through the download:
+A whole wiki space (knowledge base), when the user names a space rather than a
+single page. This walks the wiki node tree, mirrors the classification hierarchy
+on disk, and exports every node type it can (`docx` to Markdown plus local
+images, legacy `doc` as plain text, `sheet` to one CSV per visible sub-sheet,
+attachments original-first, everything else listed as unsupported):
+
+```bash
+python3 scripts/download_wiki_space.py --space-id "<SPACE_ID>" --output-dir "<dir>"
+python3 scripts/download_wiki_space.py --space-id "<SPACE_ID>" --node-token "<wikcn...>" -o "<dir>"
+python3 scripts/download_wiki_space.py --space-id "<SPACE_ID>" --dry-run    # plan only
+```
+
+Useful options for the space export: `--attachments original|preview|skip`
+(default `original`), `--workers N` (default 4; higher values cause intermittent
+API failures), `--resume` (reuse `state.json` and skip finished nodes),
+`--flat`, `--max-nodes N`, `--types a,b,c`, `--doc-host HOST`, `--lark-cli PATH`.
+The space export writes `<output-dir>/<space name>/` with `_INDEX.md` (tree plus
+status badges), `_failures.md` (failed / degraded / empty / unsupported /
+skipped), `_manifest.json`, `_manifest.csv` (UTF-8 with BOM, so Excel opens
+Chinese correctly) and `state.json` when `--resume` is used.
+
+Web UI, when the user prefers a browser and wants to click through the download.
+It offers both modes - a list of document URLs, or one whole wiki space by
+`space_id` (with attachments, workers, resume and flat toggles):
 
 ```bash
 python3 web/lark_download_web.py            # prints http://127.0.0.1:8765/
@@ -85,8 +109,22 @@ Useful options: `--retries N` (default 2), `--timeout SECONDS` (default 120),
   downloaded, and every URL that failed.
 - Exit code `0` means complete, `1` means incomplete, `2` means invalid input.
   Treat images that failed as incomplete output.
+- Warnings never change the exit code. A document whose title could not be read
+  is written under a fallback name (`<token>.md`) and logged as `[title-fallback]`;
+  the title is rescued first from the wiki node (`wiki +node-get`) and then from
+  `drive +inspect`, and `title_fallbacks[].source` records which one worked. A
+  document whose exported body is blank is logged as `[empty]`. Both are recorded
+  in the manifest and printed to stderr, and the run still exits `0`. Do not
+  report either one as a failure.
+- `scripts/download_wiki_space.py` has its own exit codes: `0` when no node
+  failed, `1` when at least one node failed or `--max-nodes` stopped the walk
+  early, `2` for invalid arguments or nothing walkable. Read `_failures.md` and
+  `_manifest.json` before claiming a full archive.
 - Read `_download-manifest.json` when the user needs source-to-file mappings or
-  failure reasons; it records `failures`, `image_failures`, and `title_failures`.
+  failure reasons; it records `failures`, `image_failures`, `documents[]`
+  (each with `status: "ok"|"empty"`, `empty`, `title_fallback`),
+  `title_fallbacks`, `empty_documents`, and the legacy aliases `title_failures`
+  / `title_failed_count`.
 - Do not claim a full archive when a document failed: descendants reachable only
   through that document were never discovered.
 - Prefer `--recursive` only when the user asked for linked/cited documents; it
@@ -100,5 +138,5 @@ Useful options: `--retries N` (default 2), `--timeout SECONDS` (default 120),
 - `references/troubleshooting.md` - login, permission, image, Windows/PowerShell
   and WSL failure modes with the matching fix. Read when a run fails.
 - `references/output-format.md` - how Feishu XML is converted (titles, bold
-  spacing, callouts, citations, manifest fields). Read when the user questions
-  the Markdown formatting.
+  spacing, callouts, citations, manifest fields, the space-export layout). Read
+  when the user questions the Markdown formatting or the manifest keys.

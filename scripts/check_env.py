@@ -38,7 +38,10 @@ from typing import Any
 
 MIN_PYTHON = (3, 10)
 DEFAULT_LARK_CLI = os.environ.get("LARK_CLI", "lark-cli")
-DEFAULT_DOMAIN = "docs"
+# `docs` covers docx export, `wiki` the node tree of a knowledge base, `drive` the
+# attachment download/preview APIs and `sheets` the CSV export.
+DEFAULT_DOMAIN = "docs,wiki,drive,sheets"
+VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
 LOGIN_EXPIRES_HINT = (
     "Device codes expire after about 10 minutes; run the command again for a "
     "fresh verification URL."
@@ -47,6 +50,14 @@ LOGIN_EXPIRES_HINT = (
 OK = "ok"
 WARN = "warn"
 FAIL = "fail"
+
+
+def read_version() -> str:
+    """Project version, kept in the repository's VERSION file."""
+    try:
+        return VERSION_FILE.read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
 
 
 def _decode_json(text: str) -> dict[str, Any] | None:
@@ -304,6 +315,7 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
     exit_code = 0 if ready else (2 if (not python_ok or not cli_ok) else 1)
     report = {
+        "version": read_version(),
         "ok": ready,
         "ready": ready,
         "exit_code": exit_code,
@@ -320,7 +332,7 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 def print_report(report: dict[str, Any]) -> None:
     symbols = {OK: "[ ok ]", WARN: "[warn]", FAIL: "[fail]"}
-    print("lark-docs-to-md environment check")
+    print(f"lark-docs-to-md environment check (v{report.get('version', 'unknown')})")
     print("=" * 40)
     for check in report["checks"]:
         print(f"{symbols.get(check['status'], '[????]')} {check['name']}: {check['detail']}")
@@ -328,8 +340,9 @@ def print_report(report: dict[str, Any]) -> None:
             print(f"       fix: {check['fix']}")
     print()
     if report["ready"]:
-        print("Result: ready. Example:")
+        print("Result: ready. Examples:")
         print('  python scripts/download_docx_tree.py "<docx-or-wiki-url>" -o ./downloads')
+        print("  python scripts/download_wiki_space.py --space-id <id> -o ./downloads")
     else:
         print("Result: not ready yet. Next steps:")
         for step in report["next_steps"]:
@@ -350,6 +363,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--json", action="store_true", help="print a JSON report")
+    parser.add_argument(
+        "--version", action="store_true", help="print the project version and exit"
+    )
     parser.add_argument(
         "--lark-cli",
         default=DEFAULT_LARK_CLI,
@@ -389,6 +405,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     runner = Runner(args.timeout)
+
+    if args.version:
+        print(read_version())
+        return 0
 
     if args.device_code:
         cli_path = resolve_lark_cli(args.lark_cli)

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
@@ -231,26 +231,54 @@ def _decode_json(text: str) -> dict[str, Any] | None:
             return None
 
 
-def _error_from_process(process: subprocess.CompletedProcess[str]) -> FetchError:
+PERMANENT_ERROR_TYPES = {"authorization", "validation", "confirmation"}
+PERMANENT_ERROR_CODES = {3380004, 99991679}
+PERMISSION_SUBTYPES = {"permission_denied", "missing_scope"}
+PERMISSION_MARKERS = (
+    "no permission",
+    "permission denied",
+    "lacks view",
+    "forbidden",
+    "does not have export permission",
+    "does not have download permission",
+)
+
+
+def cli_error_details(process: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    """Decode a lark-cli failure envelope into {type, subtype, code, message}."""
     envelope = _decode_json(process.stderr) or _decode_json(process.stdout) or {}
     error = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
-    error_type = str(error.get("type", ""))
-    subtype = str(error.get("subtype", ""))
-    error_code = error.get("code")
     message = str(error.get("message") or process.stderr.strip() or process.stdout.strip())
     if not message:
         message = f"lark-cli exited with code {process.returncode}"
-    permission_message = any(
-        marker in message.lower()
-        for marker in ("no permission", "permission denied", "lacks view", "forbidden")
+    return {
+        "type": str(error.get("type", "")),
+        "subtype": str(error.get("subtype", "")),
+        "code": error.get("code"),
+        "message": message,
+    }
+
+
+def is_permission_error(details: Mapping[str, Any]) -> bool:
+    """True when a lark-cli failure means "this identity may not read the resource"."""
+    message = str(details.get("message", "")).lower()
+    return (
+        str(details.get("subtype", "")) in PERMISSION_SUBTYPES
+        or details.get("code") in PERMANENT_ERROR_CODES
+        or any(marker in message for marker in PERMISSION_MARKERS)
     )
+
+
+def _error_from_process(process: subprocess.CompletedProcess[str]) -> FetchError:
+    details = cli_error_details(process)
+    message = str(details["message"])
     permanent = (
-        error_type in {"authorization", "validation", "confirmation"}
-        or error_code in {3380004, 99991679}
-        or permission_message
+        details["type"] in PERMANENT_ERROR_TYPES
+        or details["code"] in PERMANENT_ERROR_CODES
+        or is_permission_error(details)
     )
-    if subtype:
-        message = f"{message} ({error_type}/{subtype})"
+    if details["subtype"]:
+        message = f"{message} ({details['type']}/{details['subtype']})"
     return FetchError(message, retryable=not permanent)
 
 
@@ -294,6 +322,45 @@ def lark_cli_command(lark_cli: str, arguments: list[str]) -> list[str]:
     return command
 
 
+def lark_cli_environment() -> dict[str, str]:
+    """Environment for lark-cli calls: quiet, no update/skill notices on stderr."""
+    env = os.environ.copy()
+    env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
+    env["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
+    return env
+
+
+def run_lark_cli(
+    arguments: list[str],
+    *,
+    lark_cli: str,
+    timeout: float,
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run lark-cli, capture UTF-8 output, and never raise on a non-zero exit.
+
+    `cwd` matters for commands such as `drive +download`, whose `--output` must be
+    a relative path inside the process working directory.
+    """
+    command = lark_cli_command(lark_cli, arguments)
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=lark_cli_environment(),
+            cwd=cwd,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise FetchError(f"unable to launch lark-cli: {exc}", retryable=False) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise FetchError(f"lark-cli timed out after {timeout:g} seconds") from exc
+
+
 def fetch_document(
     ref: DocRef,
     *,
@@ -318,26 +385,7 @@ def fetch_document(
         "--format",
         "json",
     ]
-    command = lark_cli_command(lark_cli, arguments)
-    env = os.environ.copy()
-    env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
-    env["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
-
-    try:
-        process = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise FetchError(f"unable to launch lark-cli: {exc}", retryable=False) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise FetchError(f"lark-cli timed out after {timeout:g} seconds") from exc
+    process = run_lark_cli(arguments, lark_cli=lark_cli, timeout=timeout)
 
     if process.returncode != 0:
         raise _error_from_process(process)
@@ -384,6 +432,10 @@ def fetch_document_with_retries(
 
 
 def structured_document_title(document: dict[str, Any]) -> str | None:
+    # `docs +fetch --detail simple` returns only content/document_id/revision_id, so
+    # the `title` branch below is dormant on the download path: the real title lives
+    # in the leading <title> element of the exported markdown. The branch is kept for
+    # `--detail full` responses and for callers that pass a document with a title.
     title = document.get("title")
     if isinstance(title, str) and title.strip():
         return title.strip()
@@ -395,8 +447,112 @@ def structured_document_title(document: dict[str, Any]) -> str | None:
     return title or None
 
 
-def title_from_document(document: dict[str, Any], token: str) -> str:
-    return structured_document_title(document) or f"docx-{token}"
+def fetch_wiki_node_title(
+    node_token: str,
+    *,
+    lark_cli: str,
+    identity: str,
+    timeout: float,
+) -> tuple[str | None, str | None]:
+    """Return (title, error) for a wiki node via the lightweight `wiki +node-get`.
+
+    This replaces the previous full XML re-export. The markdown export never carries
+    a title, and a second full export of the same document cannot invent one, so the
+    old fallback cost a whole API call and returned nothing.
+    """
+    arguments = [
+        "wiki",
+        "+node-get",
+        "--node-token",
+        node_token,
+        "--as",
+        identity,
+        "--format",
+        "json",
+    ]
+    try:
+        process = run_lark_cli(arguments, lark_cli=lark_cli, timeout=timeout)
+    except FetchError as exc:
+        return None, str(exc)
+    if process.returncode != 0:
+        details = cli_error_details(process)
+        return None, f"wiki +node-get failed: {details['message']}"
+    envelope = _decode_json(process.stdout) or {}
+    data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+    node = data.get("node") if isinstance(data.get("node"), dict) else {}
+    for value in (data.get("title"), node.get("title")):
+        if isinstance(value, str) and value.strip():
+            return value.strip(), None
+    return None, "wiki node has no title"
+
+
+def fetch_drive_document_title(
+    url: str,
+    *,
+    lark_cli: str,
+    identity: str,
+    timeout: float,
+) -> tuple[str | None, str | None]:
+    """Return (title, error) from the lightweight `drive +inspect` metadata call.
+
+    `drive +inspect` reports the real document title for docx, legacy doc, sheet and
+    wiki URLs alike (it unwraps wiki nodes). It replaces the removed XML re-export:
+    that call cost a full document download, while this one returns metadata only.
+    """
+    arguments = [
+        "drive",
+        "+inspect",
+        "--url",
+        url,
+        "--as",
+        identity,
+        "--format",
+        "json",
+    ]
+    try:
+        process = run_lark_cli(arguments, lark_cli=lark_cli, timeout=timeout)
+    except FetchError as exc:
+        return None, str(exc)
+    if process.returncode != 0:
+        details = cli_error_details(process)
+        return None, f"drive +inspect failed: {details['message']}"
+    envelope = _decode_json(process.stdout) or {}
+    data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+    for value in (data.get("title"), (data.get("wiki_node") or {}).get("title")):
+        if isinstance(value, str) and value.strip():
+            return value.strip(), None
+    return None, "drive +inspect response has no title"
+
+
+def fallback_document_title(
+    ref: DocRef,
+    *,
+    lark_cli: str,
+    identity: str,
+    timeout: float,
+) -> tuple[str, str | None, str]:
+    """Single title-fallback path, returning (title, error, source).
+
+    Order: the wiki node's own title (cheapest, and the name the user sees in the
+    knowledge base), then `drive +inspect` document metadata, then the bare token.
+    The result never carries a `docx-`/`wiki-` type prefix - the manifest already
+    records the document type - so a fallback file is named `<token>.md`.
+    """
+    errors: list[str] = []
+    if ref.kind == "wiki":
+        title, error = fetch_wiki_node_title(
+            ref.token, lark_cli=lark_cli, identity=identity, timeout=timeout
+        )
+        if title:
+            return title, None, "wiki-node-get"
+        errors.append(error or "wiki node has no title")
+    title, error = fetch_drive_document_title(
+        ref.url, lark_cli=lark_cli, identity=identity, timeout=timeout
+    )
+    if title:
+        return title, None, "drive-inspect"
+    errors.append(error or "drive +inspect has no title")
+    return ref.token, "；".join(errors), "token"
 
 
 def safe_filename(title: str) -> str:
@@ -1000,6 +1156,7 @@ def download_tree(
     timeout: float = 120,
     max_docs: int = 0,
     recursive: bool = False,
+    group_assets: bool | None = None,
 ) -> dict[str, Any]:
     root_kind, root_token, canonical_root = parse_document_url(root_url)
     output_dir = output_dir.expanduser().resolve() / root_token
@@ -1012,7 +1169,8 @@ def download_tree(
     documents: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     image_failures: list[dict[str, Any]] = []
-    title_failures: list[dict[str, Any]] = []
+    title_fallbacks: list[dict[str, Any]] = []
+    empty_documents: list[dict[str, Any]] = []
     filename_owners: dict[str, str] = {}
     attempted = 0
     limited = False
@@ -1055,7 +1213,7 @@ def download_tree(
             timeout,
             lark_cli=lark_cli,
             identity=identity,
-            group_assets_by_document=recursive,
+            group_assets_by_document=recursive if group_assets is None else group_assets,
         )
         content = downgrade_docxxml_blocks(content)
         content = normalize_document_citations(content, ref.url)
@@ -1077,33 +1235,34 @@ def download_tree(
         if content and not content.endswith("\n"):
             content += "\n"
         title = structured_document_title(document)
+        title_is_fallback = False
         title_error: str | None = None
         if title is None:
-            title_document, title_fetch_error = fetch_document_with_retries(
-                ref,
-                lark_cli=lark_cli,
-                identity=identity,
-                timeout=timeout,
-                retries=retries,
-                doc_format="xml",
+            # Fallback naming is a warning, never a download failure: the file is
+            # written either way. See `title_fallbacks` below and the exit-code
+            # contract in README.md / SKILL.md.
+            title, title_error, title_source = fallback_document_title(
+                ref, lark_cli=lark_cli, identity=identity, timeout=timeout
             )
-            if title_document is not None:
-                title = structured_document_title(title_document)
-                if title is None:
-                    title_error = "XML response is missing a <title> element"
-            else:
-                title_error = str(title_fetch_error or "unknown title fetch error")
-        if title is None:
-            title = f"{ref.kind}-{ref.token}"
-            title_failures.append(
+            title_is_fallback = True
+            title_fallbacks.append(
                 {
                     "token": ref.token,
                     "type": ref.kind,
                     "url": ref.url,
+                    "depth": ref.depth,
+                    "discovered_from": ref.discovered_from,
                     "error": title_error,
+                    "source": title_source,
                 }
             )
-            print(f"[title-failed] {ref.url}: {title_error}", file=sys.stderr)
+            if title_error:
+                print(f"[title-fallback] {ref.url}: {title_error}", file=sys.stderr)
+            else:
+                print(
+                    f"[title-fallback] {ref.url}: title taken from {title_source}",
+                    file=sys.stderr,
+                )
         filename = unique_filename(
             title,
             ref.token,
@@ -1112,9 +1271,24 @@ def download_tree(
         )
         destination = output_dir / filename
         atomic_write_text(destination, content)
-        fallback_destination = output_dir / safe_filename(f"{ref.kind}-{ref.token}")
+        fallback_destination = output_dir / safe_filename(ref.token)
         if fallback_destination != destination:
             fallback_destination.unlink(missing_ok=True)
+
+        is_empty = content.strip() == ""
+        if is_empty:
+            empty_documents.append(
+                {
+                    "token": ref.token,
+                    "type": ref.kind,
+                    "url": ref.url,
+                    "title": title,
+                    "file": filename,
+                    "depth": ref.depth,
+                    "discovered_from": ref.discovered_from,
+                }
+            )
+            print(f"[empty] {ref.url}: exported document has no content", file=sys.stderr)
 
         links = extract_child_document_refs(content, ref.url) if recursive else []
         for child_kind, child_token, child_url in links:
@@ -1139,6 +1313,9 @@ def download_tree(
                 "url": ref.url,
                 "title": title,
                 "file": filename,
+                "status": "empty" if is_empty else "ok",
+                "empty": is_empty,
+                "title_fallback": title_is_fallback,
                 "depth": ref.depth,
                 "discovered_from": ref.discovered_from,
                 "document_id": document.get("document_id"),
@@ -1155,20 +1332,24 @@ def download_tree(
         "recursive": recursive,
         "output_dir": str(output_dir),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "complete": (
-            not failures and not image_failures and not title_failures and not limited
-        ),
+        # Only real failures make a run incomplete. Title fallbacks and empty
+        # documents are warnings: their content was written successfully.
+        "complete": not failures and not image_failures and not limited,
         "downloaded_count": len(documents),
         "failed_count": len(failures),
         "image_downloaded_count": sum(len(item["images"]) for item in documents),
         "image_failed_count": len(image_failures),
-        "title_failed_count": len(title_failures),
+        "empty_count": len(empty_documents),
+        "title_fallback_count": len(title_fallbacks),
+        "title_failed_count": len(title_fallbacks),  # backward-compatible alias
         "limited": limited,
         "pending_count": len(queue),
         "documents": documents,
         "failures": failures,
         "image_failures": image_failures,
-        "title_failures": title_failures,
+        "empty_documents": empty_documents,
+        "title_fallbacks": title_fallbacks,
+        "title_failures": title_fallbacks,  # backward-compatible alias
     }
     atomic_write_text(
         output_dir / "_download-manifest.json",
@@ -1277,7 +1458,8 @@ def main(argv: list[str] | None = None) -> int:
         f"failed={manifest['failed_count']} "
         f"images={manifest['image_downloaded_count']} "
         f"image_failed={manifest['image_failed_count']} "
-        f"title_failed={manifest['title_failed_count']} "
+        f"title_fallback={manifest['title_fallback_count']} "
+        f"empty={manifest['empty_count']} "
         f"recursive={manifest['recursive']} "
         f"limited={manifest['limited']}"
     )

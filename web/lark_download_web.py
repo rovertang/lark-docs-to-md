@@ -64,6 +64,7 @@ WEB_DIR = Path(__file__).resolve().parent
 REPO_ROOT = WEB_DIR.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 DEFAULT_DOWNLOAD_SCRIPT = SCRIPTS_DIR / "download_docx_tree.py"
+SPACE_SCRIPT = SCRIPTS_DIR / "download_wiki_space.py"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "downloads"
 MAX_LOG_LINES = 20000
 TERMINATE_GRACE_SECONDS = 5.0
@@ -105,6 +106,8 @@ class JobItem:
     failed: int = 0
     images: int = 0
     image_failed: int = 0
+    empty: int = 0
+    fallbacks: int = 0
     titles: list[str] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
     message: str = ""
@@ -201,6 +204,48 @@ def build_command(
     return command
 
 
+def build_space_command(
+    output_root: Path,
+    options: dict[str, Any],
+    lark_cli: str,
+) -> list[str]:
+    """Whole knowledge-base export, driven by scripts/download_wiki_space.py."""
+    command = [
+        sys.executable,
+        str(SPACE_SCRIPT),
+        "--space-id",
+        str(options.get("space_id", "")),
+        "-o",
+        str(output_root),
+        "-i",
+        str(options.get("identity", "user")),
+        "--attachments",
+        str(options.get("attachments", "original")),
+        "--workers",
+        str(options.get("workers", 4)),
+        "--retries",
+        str(options.get("retries", 2)),
+        "--timeout",
+        str(options.get("timeout", 120)),
+        "--doc-host",
+        str(options.get("doc_host", "feishu.cn")),
+        "--lark-cli",
+        lark_cli,
+    ]
+    if options.get("space_node_token"):
+        command.extend(["--node-token", str(options["space_node_token"])])
+    if options.get("space_types"):
+        command.extend(["--types", str(options["space_types"])])
+    if options.get("resume"):
+        command.append("--resume")
+    if options.get("flat"):
+        command.append("--flat")
+    max_nodes = int(options.get("max_nodes") or 0)
+    if max_nodes > 0:
+        command.extend(["--max-nodes", str(max_nodes)])
+    return command
+
+
 def _journal_command(command: list[str]) -> str:
     return "$ " + " ".join(shlex.quote(part) for part in command)
 
@@ -216,8 +261,21 @@ def _parse_progress(item: JobItem, line: str, job: Job) -> None:
     if line.startswith("[image-failed]"):
         item.image_failed += 1
         return
-    if line.startswith("[title-failed]"):
+    if line.startswith("[title-fallback]"):
+        item.fallbacks += 1
         job.append_log("    (title fallback used for one document)")
+        return
+    if line.startswith("[title-failed]"):  # legacy prefix from v1.1 and older
+        item.fallbacks += 1
+        job.append_log("    (title fallback used for one document)")
+        return
+    if line.startswith("[empty]"):
+        item.empty += 1
+        job.append_log("    (exported document has no content)")
+        return
+    if line.startswith("[warn]"):
+        job.append_log("    (warning from the space exporter; see _manifest.json)")
+        return
 
 
 def _read_manifest(output_dir: Path) -> dict[str, Any] | None:
@@ -236,6 +294,10 @@ def finalize_item(item: JobItem, exit_code: int, manifest: dict[str, Any] | None
         item.failed = int(manifest.get("failed_count", 0))
         item.images = int(manifest.get("image_downloaded_count", 0))
         item.image_failed = int(manifest.get("image_failed_count", 0))
+        item.empty = int(manifest.get("empty_count", 0))
+        item.fallbacks = int(
+            manifest.get("title_fallback_count", manifest.get("title_failed_count", 0))
+        )
         item.titles = [str(doc.get("title", "")) for doc in documents if doc.get("title")]
         item.failures = [
             {"url": failure.get("url"), "error": failure.get("error")}
@@ -255,6 +317,54 @@ def finalize_item(item: JobItem, exit_code: int, manifest: dict[str, Any] | None
         item.message = "download failed"
 
 
+def _find_space_manifest(output_root: Path) -> tuple[dict[str, Any] | None, Path | None]:
+    """Locate the `_manifest.json` written by download_wiki_space.py."""
+    candidates = sorted(
+        output_root.glob("*/_manifest.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("space_id"):
+            return data, path.parent
+    return None, None
+
+
+def finalize_space_item(item: JobItem, exit_code: int, output_root: Path) -> None:
+    """A whole-space export reports totals through its own manifest."""
+    item.exit_code = exit_code
+    manifest, space_dir = _find_space_manifest(output_root)
+    if manifest is None:
+        item.status = "failed" if exit_code != 0 else "ok"
+        item.message = "空间导出未生成 _manifest.json" if exit_code != 0 else "complete"
+        return
+    counts = manifest.get("counts") or {}
+    item.downloaded = int(counts.get("ok", 0))
+    item.failed = int(counts.get("failed", 0))
+    item.empty = int(counts.get("empty", 0))
+    item.titles = [str(manifest.get("space_name") or item.token)]
+    item.output_dir = str(space_dir) if space_dir else None
+    partial = int(counts.get("partial", 0))
+    unsupported = int(counts.get("unsupported", 0))
+    skipped = int(counts.get("skipped", 0))
+    item.message = (
+        f"节点 {manifest.get('total_nodes', 0)}：成功 {item.downloaded}、"
+        f"降级 {partial}、空 {item.empty}、失败 {item.failed}、"
+        f"不支持 {unsupported}、跳过 {skipped}"
+    )
+    if exit_code == 0:
+        item.status = "ok"
+        item.message = "complete; " + item.message
+    elif item.downloaded or partial:
+        item.status = "partial"
+    else:
+        item.status = "failed"
+
+
 def run_job(job: Job, lark_cli: str) -> None:
     options = job.options
     output_root = Path(job.output_root)
@@ -272,7 +382,10 @@ def run_job(job: Job, lark_cli: str) -> None:
             item.status = "running"
             item.started_at = utc_now()
             job.append_log(f"[{index}/{len(job.items)}] {item.url}")
-            command = build_command(item.url, output_root, options, lark_cli)
+            if options.get("mode") == "space":
+                command = build_space_command(output_root, options, lark_cli)
+            else:
+                command = build_command(item.url, output_root, options, lark_cli)
             job.append_log(_journal_command(command))
             try:
                 process = subprocess.Popen(
@@ -313,14 +426,17 @@ def run_job(job: Job, lark_cli: str) -> None:
                 job.append_log(f"-- cancelled (exit code {exit_code})")
                 continue
 
-            output_dir = output_root / item.token if item.token else output_root
-            item.output_dir = str(output_dir)
-            finalize_item(item, exit_code, _read_manifest(output_dir))
+            if options.get("mode") == "space":
+                finalize_space_item(item, exit_code, output_root)
+            else:
+                output_dir = output_root / item.token if item.token else output_root
+                item.output_dir = str(output_dir)
+                finalize_item(item, exit_code, _read_manifest(output_dir))
             item.finished_at = utc_now()
             job.append_log(
                 f"-- {item.status}: downloaded={item.downloaded} failed={item.failed} "
                 f"images={item.images} image_failed={item.image_failed} "
-                f"exit={exit_code}"
+                f"empty={item.empty} title_fallback={item.fallbacks} exit={exit_code}"
             )
     except Exception as exc:  # pragma: no cover - defensive
         job.error = f"{type(exc).__name__}: {exc}"
@@ -608,16 +724,9 @@ class Handler(BaseHTTPRequestHandler):
     # -- job endpoints ---------------------------------------------------
     def _create_job(self) -> None:
         body = self._read_json_body()
-        raw_urls = body.get("urls")
-        if isinstance(raw_urls, str):
-            raw_lines = raw_urls.splitlines()
-        elif isinstance(raw_urls, list):
-            raw_lines = [str(item) for item in raw_urls]
-        else:
-            raw_lines = []
-        raw_lines = [line for line in raw_lines if line.strip()]
-        if not raw_lines:
-            raise ValueError("provide at least one document URL")
+        mode = str(body.get("mode") or "docs").strip().lower()
+        if mode not in {"docs", "space"}:
+            mode = "docs"
 
         output_dir = str(body.get("output_dir") or SERVER_CONFIG["output_dir"]).strip()
         output_root = Path(output_dir).expanduser()
@@ -632,12 +741,25 @@ class Handler(BaseHTTPRequestHandler):
         identity = str(body.get("identity") or SERVER_CONFIG["identity"])
         if identity not in {"user", "bot"}:
             identity = "user"
+        attachments = str(body.get("attachments") or "original").strip().lower()
+        if attachments not in {"original", "preview", "skip"}:
+            attachments = "original"
         options = {
+            "mode": mode,
             "recursive": bool(body.get("recursive")),
             "identity": identity,
             "retries": max(0, int(body.get("retries", 2))),
             "timeout": max(1.0, float(body.get("timeout", 120))),
             "max_docs": max(0, int(body.get("max_docs", 0))),
+            "max_nodes": max(0, int(body.get("max_nodes", 0))),
+            "space_id": str(body.get("space_id") or "").strip(),
+            "space_node_token": str(body.get("space_node_token") or "").strip(),
+            "space_types": str(body.get("space_types") or "").strip(),
+            "attachments": attachments,
+            "workers": max(1, int(body.get("workers", 4))),
+            "resume": bool(body.get("resume")),
+            "flat": bool(body.get("flat")),
+            "doc_host": str(body.get("doc_host") or "feishu.cn").strip() or "feishu.cn",
         }
 
         job = Job(
@@ -647,17 +769,42 @@ class Handler(BaseHTTPRequestHandler):
             output_root=str(output_root),
             items=[],
         )
-        urls = collect_urls(raw_lines, job)
-        for url in urls:
-            try:
-                kind, token, _ = download_docx_tree.parse_document_url(url)
-            except ValueError:
-                continue
-            job.items.append(JobItem(url=url, kind=kind, token=token))
-        if not job.items:
-            hint = "\n".join(job.log[-10:]) or "no valid /docx/ or /wiki/ URL found"
-            self._error(400, hint)
-            return
+
+        if mode == "space":
+            space_id = options["space_id"]
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", space_id or ""):
+                raise ValueError(
+                    "提供一个知识库 space_id（可用 `lark-cli wiki +space-list` 查询）"
+                )
+            job.items.append(
+                JobItem(
+                    url=f"wiki-space://{space_id}",
+                    kind="wiki-space",
+                    token=space_id,
+                )
+            )
+        else:
+            raw_urls = body.get("urls")
+            if isinstance(raw_urls, str):
+                raw_lines = raw_urls.splitlines()
+            elif isinstance(raw_urls, list):
+                raw_lines = [str(item) for item in raw_urls]
+            else:
+                raw_lines = []
+            raw_lines = [line for line in raw_lines if line.strip()]
+            if not raw_lines:
+                raise ValueError("provide at least one document URL")
+            urls = collect_urls(raw_lines, job)
+            for url in urls:
+                try:
+                    kind, token, _ = download_docx_tree.parse_document_url(url)
+                except ValueError:
+                    continue
+                job.items.append(JobItem(url=url, kind=kind, token=token))
+            if not job.items:
+                hint = "\n".join(job.log[-10:]) or "no valid /docx/ or /wiki/ URL found"
+                self._error(400, hint)
+                return
 
         with JOBS_LOCK:
             JOBS[job.id] = job
@@ -669,15 +816,25 @@ class Handler(BaseHTTPRequestHandler):
     def _job_output_root(self, job: Job) -> Path:
         return Path(job.output_root).resolve()
 
+    def _item_directories(self, job: Job) -> list[Path]:
+        """Directories this job may read files from (preview/zip containment)."""
+        root = self._job_output_root(job)
+        directories: list[Path] = []
+        for item in job.items:
+            candidate = Path(item.output_dir) if item.output_dir else None
+            if candidate is None and item.token and item.kind != "wiki-space":
+                candidate = root / item.token
+            if candidate is not None and candidate.is_dir():
+                directories.append(candidate.resolve())
+        return directories or [root]
+
     def _resolve_within_root(self, job: Job, relative: str) -> Path | None:
         root = self._job_output_root(job)
         candidate = (root / relative).resolve()
-        # Allow only paths inside a directory created by this job (token dirs).
-        tokens = {item.token for item in job.items if item.token}
-        allowed = [root / token for token in tokens]
-        for base in allowed:
+        # Allow only paths inside a directory created by this job.
+        for base in self._item_directories(job):
             try:
-                candidate.relative_to(base.resolve())
+                candidate.relative_to(base)
                 return candidate
             except ValueError:
                 continue
@@ -685,16 +842,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_files(self, job: Job) -> None:
         root = self._job_output_root(job)
-        tokens = {item.token: item for item in job.items if item.token}
+        item_by_dir: dict[str, JobItem] = {}
+        for item in job.items:
+            directory = Path(item.output_dir) if item.output_dir else (
+                root / item.token if item.token and item.kind != "wiki-space" else None
+            )
+            if directory is not None:
+                item_by_dir[str(directory.resolve())] = item
+        directories = self._item_directories(job)
         files: list[dict[str, Any]] = []
-        for token, item in tokens.items():
-            directory = root / token
-            if not directory.is_dir():
-                continue
+        for directory in directories:
+            item = item_by_dir.get(str(directory))
             for path in sorted(directory.rglob("*")):
-                if not path.is_file() or path.name == "_download-manifest.json":
+                if not path.is_file() or path.name in {"_download-manifest.json", "_manifest.json"}:
                     continue
-                if path.suffix.lower() not in {".md", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}:
+                if path.suffix.lower() not in {
+                    ".md", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp",
+                    ".csv", ".pdf", ".html", ".txt", ".docx", ".doc", ".xlsx", ".zip",
+                }:
                     continue
                 try:
                     relative = path.relative_to(root).as_posix()
@@ -702,12 +867,12 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 files.append(
                     {
-                        "token": token,
-                        "title": item.titles[0] if item.titles else token,
+                        "token": item.token if item else "",
+                        "title": (item.titles[0] if item and item.titles else path.stem),
                         "path": relative,
                         "name": path.name,
                         "size": path.stat().st_size,
-                        "is_markdown": path.suffix.lower() == ".md",
+                        "is_markdown": path.suffix.lower() in {".md", ".csv"},
                     }
                 )
         self._json({"files": files, "output_root": str(root)})
@@ -726,25 +891,36 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             self._error(500, str(exc))
             return
-        content_type = "text/plain; charset=utf-8" if resolved.suffix.lower() == ".md" else "application/octet-stream"
+        text_suffixes = {".md", ".csv", ".txt", ".html"}
+        content_type = (
+            "text/plain; charset=utf-8"
+            if resolved.suffix.lower() in text_suffixes
+            else "application/octet-stream"
+        )
         self._send(200, data, content_type)
 
     def _handle_archive(self, job: Job) -> None:
         root = self._job_output_root(job)
-        tokens = [item.token for item in job.items if item.token]
-        if not tokens:
+        directories = [path for path in self._item_directories(job) if path.is_dir()]
+        if not directories:
             self._error(404, "nothing to archive")
             return
         buffer = io.BytesIO()
         base = f"lark-docs-{job.id}"
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-            for token in tokens:
-                directory = root / token
-                if not directory.is_dir():
-                    continue
+            for directory in directories:
+                try:
+                    within = directory.relative_to(root).as_posix()
+                except ValueError:
+                    within = directory.name
                 for path in sorted(directory.rglob("*")):
                     if path.is_file():
-                        archive.write(path, arcname=posixpath.join(base, token, path.relative_to(directory).as_posix()))
+                        archive.write(
+                            path,
+                            arcname=posixpath.join(
+                                base, within, path.relative_to(directory).as_posix()
+                            ),
+                        )
         body = buffer.getvalue()
         filename = f"{base}.zip"
         self._send(
@@ -846,12 +1022,60 @@ PAGE = r"""<!doctype html>
 <main>
   <section>
     <div class="card">
-      <h2>1 · 待下载文档</h2>
-      <label for="urls">每行一个飞书 /docx/ 或 /wiki/ 链接（也支持直接粘贴一个 URL 列表文本文件的路径）</label>
-      <textarea id="urls" placeholder="https://xxx.feishu.cn/docx/Qj58dcHFAoOcOVx5l7mcEK5Hnjb&#10;https://xxx.feishu.cn/docx/Dwhudsgy8oKOUmx03AXcHiX8nvg"></textarea>
-      <div class="check">
-        <input type="checkbox" id="recursive">
-        <label for="recursive" style="margin:0">递归下载文档内引用的子文档（关闭时等价于批量脚本 batch_download.py 的行为）</label>
+      <h2>1 · 下载内容</h2>
+      <div class="row" style="margin-bottom:6px">
+        <div>
+          <label for="mode">模式</label>
+          <select id="mode">
+            <option value="docs">文档链接（单篇 / 批量 / 递归）</option>
+            <option value="space">知识库空间（整库镜像，含附件与表格）</option>
+          </select>
+        </div>
+      </div>
+      <div id="docsFields">
+        <label for="urls">每行一个飞书 /docx/ 或 /wiki/ 链接（也支持直接粘贴一个 URL 列表文本文件的路径）</label>
+        <textarea id="urls" placeholder="https://xxx.feishu.cn/docx/Qj58dcHFAoOcOVx5l7mcEK5Hnjb&#10;https://xxx.feishu.cn/docx/Dwhudsgy8oKOUmx03AXcHiX8nvg"></textarea>
+        <div class="check">
+          <input type="checkbox" id="recursive">
+          <label for="recursive" style="margin:0">递归下载文档内引用的子文档（关闭时等价于批量脚本 batch_download.py 的行为）</label>
+        </div>
+      </div>
+      <div id="spaceFields" style="display:none">
+        <div class="row">
+          <div>
+            <label for="spaceId">知识库 space_id</label>
+            <input id="spaceId" placeholder="7007715075855450113">
+          </div>
+          <div>
+            <label for="spaceNodeToken">仅导出某棵子树（可选，wikcn… 节点 token）</label>
+            <input id="spaceNodeToken" placeholder="留空表示整个空间">
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="attachments">附件（file 节点）</label>
+            <select id="attachments">
+              <option value="original">original（下原件，失败时回退预览件）</option>
+              <option value="preview">preview（只存预览件）</option>
+              <option value="skip">skip（不下附件）</option>
+            </select>
+          </div>
+          <div>
+            <label for="workers">并发数（默认 4，过高会被限流）</label>
+            <input id="workers" type="number" min="1" value="4">
+          </div>
+          <div>
+            <label for="spaceTypes">节点类型（逗号分隔，留空=全部）</label>
+            <input id="spaceTypes" placeholder="docx,doc,file,sheet">
+          </div>
+        </div>
+        <div class="check">
+          <input type="checkbox" id="resume">
+          <label for="resume" style="margin:0">断点续传 --resume（跳过已完成节点）</label>
+          <input type="checkbox" id="flat" style="margin-left:12px">
+          <label for="flat" style="margin:0">--flat（不镜像层级）</label>
+        </div>
+        <p class="hint">知识库导出会生成 <code>_INDEX.md</code>、<code>_failures.md</code>、<code>_manifest.json/csv</code>，并按 wiki 目录层级镜像到 <code>&lt;输出目录&gt;/&lt;空间名&gt;/</code>。</p>
       </div>
       <div class="row">
         <div>
@@ -869,7 +1093,7 @@ PAGE = r"""<!doctype html>
       <div class="row">
         <div><label for="retries">失败重试次数</label><input id="retries" type="number" min="0" value="2"></div>
         <div><label for="timeout">单次超时（秒）</label><input id="timeout" type="number" min="1" value="120"></div>
-        <div><label for="maxDocs">最大文档数（0=不限，仅递归）</label><input id="maxDocs" type="number" min="0" value="0"></div>
+        <div><label for="maxDocs">上限（0=不限：递归模式的文档数 / 知识库的节点数）</label><input id="maxDocs" type="number" min="0" value="0"></div>
       </div>
       <div class="row" style="margin-top:14px">
         <button id="btnStart">开始下载</button>
@@ -1004,22 +1228,50 @@ async function completeLogin() {
 
 async function startJob() {
   showError('');
-  const urls = $('urls').value;
-  if (!urls.trim()) { showError('请至少粘贴一个飞书文档链接。'); return; }
+  const mode = $('mode').value;
+  const outputDir = $('outputDir').value;
+  const retries = Number($('retries').value || 0);
+  const timeout = Number($('timeout').value || 120);
+  const maxDocs = Number($('maxDocs').value || 0);
+  let payload;
+  if (mode === 'space') {
+    const spaceId = $('spaceId').value.trim();
+    if (!spaceId) { showError('请填写知识库 space_id（可用 lark-cli wiki +space-list 查询）。'); return; }
+    payload = {
+      mode: 'space',
+      space_id: spaceId,
+      space_node_token: $('spaceNodeToken').value.trim(),
+      space_types: $('spaceTypes').value.trim(),
+      attachments: $('attachments').value,
+      workers: Number($('workers').value || 4),
+      resume: $('resume').checked,
+      flat: $('flat').checked,
+      max_nodes: maxDocs,
+      identity: $('identity').value,
+      output_dir: outputDir,
+      retries: retries,
+      timeout: timeout,
+    };
+  } else {
+    const urls = $('urls').value;
+    if (!urls.trim()) { showError('请至少粘贴一个飞书文档链接。'); return; }
+    payload = {
+      mode: 'docs',
+      urls: urls,
+      recursive: $('recursive').checked,
+      identity: $('identity').value,
+      output_dir: outputDir,
+      retries: retries,
+      timeout: timeout,
+      max_docs: maxDocs,
+    };
+  }
   $('btnStart').disabled = true;
   try {
     const job = await api('/api/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        urls: urls,
-        recursive: $('recursive').checked,
-        identity: $('identity').value,
-        output_dir: $('outputDir').value,
-        retries: Number($('retries').value || 0),
-        timeout: Number($('timeout').value || 120),
-        max_docs: Number($('maxDocs').value || 0),
-      }),
+      body: JSON.stringify(payload),
     });
     currentJob = job.id;
     logOffset = 0;
@@ -1059,6 +1311,8 @@ function renderJob(job) {
     meta.push('文档 ' + item.downloaded + ' · 图片 ' + item.images);
     if (item.failed) meta.push('失败文档 ' + item.failed);
     if (item.image_failed) meta.push('失败图片 ' + item.image_failed);
+    if (item.empty) meta.push('空文档 ' + item.empty);
+    if (item.fallbacks) meta.push('标题回退 ' + item.fallbacks);
     if (item.exit_code !== null && item.exit_code !== undefined) meta.push('exit ' + item.exit_code);
     if (item.message) meta.push(item.message);
     div.innerHTML = '<span class="status"><span class="dot ' + statusClass(item.status) + '"></span>' +
@@ -1167,7 +1421,17 @@ $('btnZip').onclick = downloadZip;
 $('btnRefresh').onclick = renderFiles;
 $('btnClosePreview').onclick = () => { $('preview').style.display = 'none'; };
 
+function applyMode() {
+  const mode = $('mode').value;
+  $('docsFields').style.display = mode === 'docs' ? '' : 'none';
+  $('spaceFields').style.display = mode === 'space' ? '' : 'none';
+  $('maxDocs').closest('div').querySelector('label').textContent =
+    mode === 'space' ? '最大节点数（0=不限，安全上限）' : '最大文档数（0=不限，仅递归）';
+}
+$('mode').onchange = applyMode;
+
 (async function init() {
+  applyMode();
   try { await loadConfig(); } catch (e) { showError(String(e.message || e)); }
   await refreshEnv();
 })();
