@@ -7,6 +7,52 @@
 
 暂无。
 
+## [1.2.1] - 2026-09-21
+
+修复 v1.2.0 验收测试报告（`公司管理制度` 279 节点全量回归，ok=172 / partial=103 / empty=2 / failed=2）
+提出的 5 个问题。回归基线与独立实现逐位吻合，本版只修缺陷，不改变既有能力边界。
+
+### 修复
+
+- **B1（中高）多子表工作簿丢失子表名**：真实的 `lark-cli sheets +workbook-info` 返回字段是
+  **`sheet_name`**，没有 `title`；旧代码先读 `title`，于是多子表全部落到不可读的 `sheet_id`，
+  导出成 `公司协议酒店__0hLOFe.csv` 这类文件，子表名到文件的映射彻底丢失。
+  现在按 `sheet_name` → `sheetName` → `title` → `sheet_id` 取值，并新增
+  `sheets: [{sheet_id, sheet_name, file}]` 记录，即使将来再出现命名碰撞也能追溯；
+  `detail` 里也会列出子表名。（单子表工作簿走 `final` 分支，所以旧自测没暴露该问题。）
+- **B2（中）`_INDEX.md` 与 summary 的文件数/体积少算图片**：旧实现只统计「有产物的节点数」和
+  节点自身产物的字节数，docx 节点下载的图片（`assets/<token>/`）完全没计入——
+  279 节点归档实测 277 个 / 51.3 MB，而磁盘实况是 424 个 / 72.3 MB，看起来小了 29%，
+  容易被误判成"图片没下下来"。
+  现在 `file_count` / `total_size_bytes` 表示**磁盘实况**，并另外给出
+  `disk_file_count` / `disk_size_bytes` / `node_file_count` / `node_size_bytes` /
+  `asset_count` / `asset_size_bytes`，每个 docx 节点还有自己的 `asset_count` / `asset_size_bytes`；
+  `_INDEX.md` 与 summary 会写成「节点产物 N + 图片等资源 M」两段式。
+  本工具自己的台账文件（`_INDEX.md` / `_failures.md` / `_manifest.*` / `state.json`）不计入，
+  这样数字不依赖测量时机。
+- **B3（低）`--resume` 在没有 `state.json` 时静默不生效**：失败后加 `--resume` 重跑会全量重下。
+  现在 `--resume` 未找到可用检查点时会明确提示
+  「未找到可用的 state.json（不存在或与本轮参数不匹配）：本次不会跳过任何节点。检查点只有在带 `--resume` 运行时才会写入」；
+  反向情况（存在 `state.json` 但没加 `--resume`）也会提示「本次将重新处理所有节点」。
+- **B4（低）两个入口的无标题回退命名不一致**：`download_docx_tree.py` 用 `<token>.md`，
+  整库导出用 `未命名-<token[:8]>.md`。现统一为 **`未命名-<token[:8]>`**（人可读），
+  两个入口对同一篇无标题文档产出同名文件。
+- **B5（提示）旧版 doc 的 `format` 字段为 `null`**：现在每条清单都带 `format`
+  （`markdown` / `text` / `csv` / 附件后缀 / 预览类型），`_manifest.csv` 也新增 `format` 列。
+
+### 文档
+
+- README、`SKILL.md`、`references/output-format.md`、`references/troubleshooting.md`
+  同步修订：回退命名、子表命名、文件与体积口径、`--resume` 提示、新增 manifest 字段与 CSV 列。
+
+### 兼容性
+
+- 既有 CLI 参数、退出码契约、`title_failures` / `title_failed_count` 别名均未破坏。
+- 两处**行为变更**（均为修缺陷，已在此说明）：
+  1. 无标题文档的回退文件名由 `<token>.md` 变为 `未命名-<token[:8]>.md`；
+  2. `_manifest.json` 的 `file_count` / `total_size_bytes` 从"节点产物"改为"磁盘实况（含图片）"，
+     原口径可通过 `node_file_count` / `node_size_bytes` 取回。
+
 ## [1.2.0] - 2026-09-21
 
 ### 修复
@@ -84,4 +130,5 @@
   依赖旧行为把标题回退当失败来判断"未完整"的调用方，需要改读 `title_fallbacks` / `empty_documents`。
 
 [未发布]: http://192.168.3.88:10082/rovertang/lark-docs-to-md/commits/main
+[1.2.1]: http://192.168.3.88:10082/rovertang/lark-docs-to-md/releases/tag/v1.2.1
 [1.2.0]: http://192.168.3.88:10082/rovertang/lark-docs-to-md/releases/tag/v1.2.0

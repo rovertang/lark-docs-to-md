@@ -204,8 +204,9 @@ class DownloadDocxTreeTests(unittest.TestCase):
         self.assertEqual(manifest["failed_count"], 0)
         self.assertEqual(manifest["title_fallback_count"], 1)
         self.assertEqual(manifest["title_fallbacks"][0]["source"], "token")
-        # fallback file name is the bare token, with no `docx-`/`wiki-` prefix
-        self.assertEqual(files, ["RootToken.md"])
+        # fallback file name is the readable placeholder, shared with the space exporter
+        self.assertEqual(files, ["未命名-RootToke.md"])
+        self.assertEqual(manifest["documents"][0]["title"], "未命名-RootToke")
         # `title_failures` stays as a backward-compatible alias of `title_fallbacks`
         self.assertEqual(manifest["title_failures"], manifest["title_fallbacks"])
 

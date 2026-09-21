@@ -102,6 +102,15 @@ MISSING_SCOPE_HINT = (
     "python3 scripts/check_env.py --login --domain docs,wiki,drive,sheets"
 )
 RESERVED_NAMES = {"_index", "_failures", "_manifest", "state"}
+# Bookkeeping written by this exporter; excluded from the reported archive totals so
+# the numbers are deterministic (they do not depend on when they are measured).
+BOOKKEEPING_FILES = {
+    "_INDEX.md",
+    "_failures.md",
+    "_manifest.json",
+    "_manifest.csv",
+    "state.json",
+}
 
 
 def utc_now() -> str:
@@ -130,6 +139,48 @@ def short_text(text: str, limit: int = 90) -> str:
     """Keep console lines readable; the full reason stays in the manifest."""
     collapsed = re.sub(r"\s+", " ", text).strip()
     return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
+
+
+def tree_stats(
+    directory: Path, *, skip_names: Iterable[str] = ()
+) -> tuple[int, int]:
+    """Return (file count, total bytes) for a directory tree."""
+    skipped = set(skip_names)
+    files = 0
+    size = 0
+    if directory.is_dir():
+        for path in directory.rglob("*"):
+            if not path.is_file() or path.name in skipped:
+                continue
+            files += 1
+            try:
+                size += path.stat().st_size
+            except OSError:
+                continue
+    return files, size
+
+
+def archive_stats(ctx: "Context", entries: Mapping[str, dict[str, Any]]) -> dict[str, int]:
+    """Separate what the nodes produced from what is actually on disk.
+
+    A `docx` node's Markdown is tiny; its images live in `assets/<token>/` and used
+    to be missing from the reported totals, which made an archive look ~29% smaller
+    than it really is. This exporter's own bookkeeping files (`_INDEX.md`,
+    `_manifest.*`, `state.json`) are excluded so the totals stay deterministic.
+    """
+    node_files = sum(1 for entry in entries.values() if entry.get("local_file"))
+    node_size = sum(int(entry.get("size_bytes") or 0) for entry in entries.values())
+    asset_files = sum(int(entry.get("asset_count") or 0) for entry in entries.values())
+    asset_size = sum(int(entry.get("asset_size_bytes") or 0) for entry in entries.values())
+    disk_files, disk_size = tree_stats(ctx.output_dir, skip_names=BOOKKEEPING_FILES)
+    return {
+        "disk_file_count": disk_files,
+        "disk_size_bytes": disk_size,
+        "node_file_count": node_files,
+        "node_size_bytes": node_size,
+        "asset_count": asset_files,
+        "asset_size_bytes": asset_size,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -461,8 +512,11 @@ def base_entry(node: WikiNode, ctx: Context) -> dict[str, Any]:
         "is_container": node.is_container,
         "status": "ok",
         "method": "",
+        "format": None,
         "local_file": None,
         "size_bytes": 0,
+        "asset_count": 0,
+        "asset_size_bytes": 0,
         "images": 0,
         "detail": "",
         "url": ctx.node_url(node),
@@ -538,8 +592,12 @@ def export_docx(node: WikiNode, ctx: Context) -> dict[str, Any]:
         assets = _merge_assets(staging / "assets", final.parent / "assets")
 
         entry["local_file"] = final.relative_to(ctx.output_dir).as_posix()
+        entry["format"] = "markdown"
         entry["size_bytes"] = final.stat().st_size
         entry["images"] = int(manifest.get("image_downloaded_count", 0))
+        asset_files, asset_size = tree_stats(final.parent / "assets" / node.node_token)
+        entry["asset_count"] = asset_files
+        entry["asset_size_bytes"] = asset_size
         empty = bool(manifest.get("empty_count"))
         entry["status"] = "empty" if empty else "ok"
         details = [f"标题：{documents[0].get('title') or node.title}"]
@@ -598,6 +656,7 @@ def export_legacy_doc(node: WikiNode, ctx: Context) -> dict[str, Any]:
     )
     atomic_write_text(final, body)
     entry["local_file"] = final.relative_to(ctx.output_dir).as_posix()
+    entry["format"] = "text"
     entry["size_bytes"] = final.stat().st_size
     entry["status"] = "empty" if not content.strip() else "ok"
     entry["detail"] = "纯文本导出，格式已丢失" + ("；正文为空" if not content.strip() else "")
@@ -655,7 +714,9 @@ def export_sheet(node: WikiNode, ctx: Context) -> dict[str, Any]:
         entry["detail"] = f"读取工作簿信息失败：{error}"
         return entry
     data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
-    sheets = _first_dict_list(data, require_any=("sheet_id", "sheetId", "title"))
+    sheets = _first_dict_list(
+        data, require_any=("sheet_id", "sheetId", "sheet_name", "title")
+    )
     visible = [sheet for sheet in sheets if not _is_hidden(sheet)]
     if not sheets:
         entry["status"] = "failed"
@@ -668,11 +729,21 @@ def export_sheet(node: WikiNode, ctx: Context) -> dict[str, Any]:
 
     written: list[str] = []
     failures: list[str] = []
+    sheet_records: list[dict[str, Any]] = []
     total_size = 0
     used_names: set[str] = set()
     for index, sheet in enumerate(visible, 1):
         sheet_id = str(sheet.get("sheet_id") or sheet.get("sheetId") or "")
-        sheet_title = str(sheet.get("title") or sheet_id or f"sheet{index}")
+        # The real `sheets +workbook-info` payload carries `sheet_name`; `title`
+        # only exists in some wrappers. Reading `title` first silently produced
+        # CSVs named after the unreadable sheet_id.
+        sheet_title = str(
+            sheet.get("sheet_name")
+            or sheet.get("sheetName")
+            or sheet.get("title")
+            or sheet_id
+            or f"sheet{index}"
+        ).strip() or f"sheet{index}"
         if not sheet_id:
             failures.append(f"{sheet_title}：缺少 sheet_id")
             continue
@@ -695,8 +766,12 @@ def export_sheet(node: WikiNode, ctx: Context) -> dict[str, Any]:
         used_names.add(destination.name.casefold())
         destination.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(destination, text)
-        written.append(destination.relative_to(ctx.output_dir).as_posix())
+        relative = destination.relative_to(ctx.output_dir).as_posix()
+        written.append(relative)
         total_size += destination.stat().st_size
+        sheet_records.append(
+            {"sheet_id": sheet_id, "sheet_name": sheet_title, "file": relative}
+        )
 
     if not written:
         entry["status"] = "failed"
@@ -704,9 +779,15 @@ def export_sheet(node: WikiNode, ctx: Context) -> dict[str, Any]:
         return entry
     entry["local_file"] = written[0]
     entry["files"] = written
+    # Keep the sheet_id -> sheet_name -> file mapping in the manifest so a renamed
+    # CSV can always be traced back to the sub-sheet it came from.
+    entry["sheets"] = sheet_records
+    entry["format"] = "csv"
     entry["size_bytes"] = total_size
     entry["status"] = "partial" if failures else "ok"
     detail = f"子表 {len(written)}/{len(visible)}"
+    if written:
+        detail += "：" + "、".join(str(record["sheet_name"]) for record in sheet_records)
     if failures:
         detail += "；失败：" + "；".join(failures)
     entry["detail"] = detail
@@ -792,6 +873,7 @@ def export_attachment(node: WikiNode, ctx: Context) -> dict[str, Any]:
                 return entry
             entry["method"] = "drive-download"
             entry["local_file"] = final.relative_to(ctx.output_dir).as_posix()
+            entry["format"] = final.suffix.lstrip(".").lower() or "binary"
             entry["size_bytes"] = final.stat().st_size
             entry["status"] = "ok"
             entry["detail"] = "已下载原件"
@@ -850,6 +932,7 @@ def export_attachment(node: WikiNode, ctx: Context) -> dict[str, Any]:
         entry["detail"] = f"预览接口返回成功但未生成文件（{preview_type}）"
         return entry
     entry["local_file"] = preview_path.relative_to(ctx.output_dir).as_posix()
+    entry["format"] = preview_type
     entry["size_bytes"] = preview_path.stat().st_size
     if preview_type == "source_file":
         entry["method"] = "preview-source_file"
@@ -912,12 +995,14 @@ class StateStore:
         self._lock = threading.Lock()
         self.entries: dict[str, dict[str, Any]] = {}
         self.completed: set[str] = set()
+        self.loaded = False
         if enabled and path.is_file():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 data = {}
             if data.get("signature") == signature:
+                self.loaded = True
                 self.entries = {
                     str(key): value
                     for key, value in (data.get("nodes") or {}).items()
@@ -980,8 +1065,7 @@ def summarize(entries: list[dict[str, Any]]) -> dict[str, int]:
 
 def write_index(ctx: Context, nodes: list[WikiNode], entries: dict[str, dict[str, Any]]) -> None:
     counts = summarize(list(entries.values()))
-    total_files = sum(1 for entry in entries.values() if entry.get("local_file"))
-    total_size = sum(int(entry.get("size_bytes") or 0) for entry in entries.values())
+    stats = archive_stats(ctx, entries)
     lines = [
         f"# {ctx.space_name}",
         "",
@@ -990,7 +1074,11 @@ def write_index(ctx: Context, nodes: list[WikiNode], entries: dict[str, dict[str
         f"- 节点数：{len(nodes)}（"
         + " / ".join(f"{STATUS_LABEL[key]} {counts.get(key, 0)}" for key in STATUS_BADGE)
         + "）",
-        f"- 本地文件：{total_files} 个，共 {human_size(total_size)}",
+        f"- 本地文件：{stats['disk_file_count']} 个"
+        f"（节点产物 {stats['node_file_count']} + 图片等资源 {stats['asset_count']} + 导出清单），"
+        f"共 {human_size(stats['disk_size_bytes'])}",
+        f"- 节点产物体积：{human_size(stats['node_size_bytes'])}"
+        f"；图片等资源体积：{human_size(stats['asset_size_bytes'])}",
         f"- 输出目录：`{ctx.output_dir}`",
         "",
         "图例：" + " ".join(f"{badge} {STATUS_LABEL[key]}" for key, badge in STATUS_BADGE.items()),
@@ -1059,7 +1147,7 @@ def write_manifest(
 ) -> dict[str, Any]:
     ordered = [entries[node.node_token] for node in nodes if node.node_token in entries]
     counts = summarize(ordered)
-    total_size = sum(int(entry.get("size_bytes") or 0) for entry in ordered)
+    stats = archive_stats(ctx, entries)
     manifest = {
         "version": VERSION,
         "space_id": ctx.space_id,
@@ -1072,8 +1160,17 @@ def write_manifest(
         "identity": ctx.identity,
         "complete": counts.get("failed", 0) == 0 and not limited,
         "total_nodes": len(nodes),
-        "file_count": sum(1 for entry in ordered if entry.get("local_file")),
-        "total_size_bytes": total_size,
+        # Disk truth first: `file_count`/`total_size_bytes` count everything that is
+        # actually on disk (images included), while the node/asset split below keeps
+        # the breakdown visible.
+        "file_count": stats["disk_file_count"],
+        "total_size_bytes": stats["disk_size_bytes"],
+        "disk_file_count": stats["disk_file_count"],
+        "disk_size_bytes": stats["disk_size_bytes"],
+        "node_file_count": stats["node_file_count"],
+        "node_size_bytes": stats["node_size_bytes"],
+        "asset_count": stats["asset_count"],
+        "asset_size_bytes": stats["asset_size_bytes"],
         "counts": counts,
         "limited": limited,
         "issues": issues,
@@ -1093,9 +1190,13 @@ def write_manifest(
             "obj_type",
             "status",
             "method",
+            "format",
             "local_file",
             "size_bytes",
+            "asset_count",
+            "asset_size_bytes",
             "images",
+            "sheets",
             "detail",
             "url",
             "node_token",
@@ -1103,6 +1204,11 @@ def write_manifest(
         ]
     )
     for entry in ordered:
+        sheet_names = "、".join(
+            str(record.get("sheet_name") or "")
+            for record in (entry.get("sheets") or [])
+            if isinstance(record, dict)
+        )
         writer.writerow(
             [
                 " / ".join(entry.get("path") or []),
@@ -1110,9 +1216,13 @@ def write_manifest(
                 entry.get("obj_type") or "",
                 entry.get("status") or "",
                 entry.get("method") or "",
+                entry.get("format") or "",
                 entry.get("local_file") or "",
                 entry.get("size_bytes") or 0,
+                entry.get("asset_count") or 0,
+                entry.get("asset_size_bytes") or 0,
                 entry.get("images") or 0,
+                sheet_names,
                 entry.get("detail") or "",
                 entry.get("url") or "",
                 entry.get("node_token") or "",
@@ -1234,8 +1344,17 @@ def run(args: argparse.Namespace) -> int:
         "types": sorted(ctx.types),
     }
     state = StateStore(space_dir / "state.json", enabled=ctx.resume, signature=signature)
-    if state.completed:
-        ctx.log(f"[resume] 跳过 {len(state.completed)} 个已完成节点")
+    if ctx.resume:
+        if state.loaded:
+            ctx.log(f"[resume] 跳过 {len(state.completed)} 个已完成节点")
+        else:
+            ctx.log(
+                "[resume] 未找到可用的 state.json（不存在或与本轮参数不匹配）："
+                "本次不会跳过任何节点。检查点只有在带 --resume 运行时才会写入，"
+                "所以失败重跑请从一开始就加上 --resume。"
+            )
+    elif (space_dir / "state.json").is_file():
+        ctx.log("[hint] 检测到 state.json 但未加 --resume，本次将重新处理所有节点")
 
     pending = [node for node in nodes if node.node_token not in state.completed]
     entries: dict[str, dict[str, Any]] = {}
@@ -1281,8 +1400,12 @@ def run(args: argparse.Namespace) -> int:
         f"space={name} space_id={ctx.space_id} output={space_dir} "
         f"nodes={manifest['total_nodes']} "
         + " ".join(f"{key}={counts.get(key, 0)}" for key in STATUS_BADGE)
-        + f" files={manifest['file_count']} size={human_size(manifest['total_size_bytes'])} "
-        f"complete={manifest['complete']} resume={ctx.resume}"
+        + f" files={manifest['disk_file_count']}"
+        f" (nodes={manifest['node_file_count']} assets={manifest['asset_count']})"
+        f" size={human_size(manifest['disk_size_bytes'])}"
+        f" (nodes={human_size(manifest['node_size_bytes'])}"
+        f" assets={human_size(manifest['asset_size_bytes'])})"
+        f" complete={manifest['complete']} resume={ctx.resume}"
     )
     return 0 if manifest["complete"] else 1
 

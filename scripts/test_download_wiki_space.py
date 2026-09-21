@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from download_wiki_space import (
     Context,
+    StateStore,
     WikiNode,
     assign_layout,
     base_entry,
@@ -32,6 +33,7 @@ from download_wiki_space import (
     walk_space,
     write_failures,
     write_index,
+    write_manifest,
 )
 
 
@@ -349,6 +351,7 @@ class DownloadWikiSpaceTests(unittest.TestCase):
 
         self.assertEqual(entry["method"], "legacy-raw-content")
         self.assertEqual(entry["status"], "ok")
+        self.assertEqual(entry["format"], "text")
         self.assertIn("私车公用管理办法\n第一章 总则", written)
         # The format-loss warning must be present: raw content is plain text only.
         self.assertIn("已丢失", written)
@@ -689,6 +692,119 @@ class DownloadWikiSpaceTests(unittest.TestCase):
         self.assertEqual(entry["status"], "failed")
         self.assertIn("未生成文件", entry["detail"])
         self.assertIsNone(entry["local_file"])
+
+    # -- v1.2.1 regressions ------------------------------------------------
+    def test_multi_sheet_uses_sheet_name(self) -> None:
+        """Real `+workbook-info` payloads carry `sheet_name`, not `title`."""
+        workbook = {
+            "ok": True,
+            "data": {
+                "sheets": [
+                    {"sheet_id": "0hLOFe", "sheet_name": "华住企业会员", "is_hidden": False},
+                    {"sheet_id": "1dWNpS", "sheet_name": "上海", "is_hidden": False},
+                ]
+            },
+        }
+
+        def fake_cli_json(arguments, *, ctx, retries=None):
+            if "+workbook-info" in arguments:
+                return workbook, None
+            if "+csv-get" in arguments:
+                sheet_id = arguments[arguments.index("--sheet-id") + 1]
+                return {"ok": True, "data": {"annotated_csv": f"{sheet_id}\n"}}, None
+            raise AssertionError(f"unexpected cli_json call: {arguments}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ctx = make_context(temporary)
+            node = make_node(
+                "wikcnSheet000003", "公司协议酒店", obj_type="sheet", obj_token="shtcn2"
+            )
+            assign_layout([node], ctx=ctx)
+            with patch("download_wiki_space.cli_json", side_effect=fake_cli_json):
+                entry = export_sheet(node, ctx)
+            names = sorted(Path(name).name for name in entry["files"])
+            contents = {
+                Path(name).name: (ctx.output_dir / name).read_text(encoding="utf-8")
+                for name in entry["files"]
+            }
+
+        self.assertEqual(
+            names, ["公司协议酒店__上海.csv", "公司协议酒店__华住企业会员.csv"]
+        )
+        # no unreadable sheet_id may leak into a file name
+        self.assertNotIn("0hLOFe", " ".join(names))
+        self.assertEqual(contents["公司协议酒店__上海.csv"], "1dWNpS\n")
+        self.assertEqual(
+            [record["sheet_name"] for record in entry["sheets"]],
+            ["华住企业会员", "上海"],
+        )
+        self.assertEqual(entry["sheets"][0]["sheet_id"], "0hLOFe")
+        self.assertEqual(entry["sheets"][0]["file"], entry["files"][0])
+        self.assertEqual(entry["format"], "csv")
+
+    def test_manifest_totals_include_asset_files(self) -> None:
+        """Reported file count and size must cover images, not just node products."""
+        node = make_node("wikcnDocx000004", "带图文档", obj_type="docx")
+        with tempfile.TemporaryDirectory() as temporary:
+            ctx = make_context(temporary)
+            assign_layout([node], ctx=ctx)
+            assets = ctx.output_dir / "assets" / node.node_token
+            assets.mkdir(parents=True)
+            (assets / "image-001.png").write_bytes(b"x" * 2048)
+            markdown = ctx.output_dir / "带图文档.md"
+            markdown.write_text("# 带图文档\n", encoding="utf-8")
+
+            entry = base_entry(node, ctx)
+            entry.update(
+                {
+                    "status": "ok",
+                    "method": "docs-fetch-markdown",
+                    "format": "markdown",
+                    "local_file": "带图文档.md",
+                    "size_bytes": markdown.stat().st_size,
+                    "asset_count": 1,
+                    "asset_size_bytes": 2048,
+                }
+            )
+            entries = {node.node_token: entry}
+            manifest = write_manifest(ctx, [node], entries, issues=[], limited=False)
+            write_index(ctx, [node], entries)
+            index_text = (ctx.output_dir / "_INDEX.md").read_text(encoding="utf-8")
+            markdown_size = markdown.stat().st_size
+
+        self.assertEqual(manifest["node_file_count"], 1)
+        self.assertEqual(manifest["node_size_bytes"], markdown_size)
+        self.assertEqual(manifest["asset_count"], 1)
+        self.assertEqual(manifest["asset_size_bytes"], 2048)
+        # archive totals cover the Markdown and the image; the exporter's own
+        # bookkeeping files are excluded on purpose
+        self.assertEqual(manifest["disk_file_count"], 2)
+        self.assertEqual(manifest["total_size_bytes"], markdown_size + 2048)
+        self.assertEqual(manifest["file_count"], manifest["disk_file_count"])
+        self.assertGreaterEqual(manifest["total_size_bytes"], manifest["asset_size_bytes"])
+        self.assertIn("图片等资源 1", index_text)
+
+    def test_state_store_reports_missing_checkpoint(self) -> None:
+        """`--resume` must be able to tell "no checkpoint" from "nothing to skip"."""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            signature = {"space_id": "s1", "flat": False}
+
+            fresh = StateStore(path, enabled=True, signature=signature)
+            self.assertFalse(fresh.loaded)
+            fresh.record({"node_token": "n1", "status": "ok"})
+            self.assertTrue(path.is_file())
+
+            reloaded = StateStore(path, enabled=True, signature=signature)
+            self.assertTrue(reloaded.loaded)
+            self.assertEqual(reloaded.completed, {"n1"})
+
+            mismatched = StateStore(path, enabled=True, signature={"space_id": "s2"})
+            self.assertFalse(mismatched.loaded)
+            self.assertEqual(mismatched.completed, set())
+
+            disabled = StateStore(path, enabled=False, signature=signature)
+            self.assertFalse(disabled.loaded)
 
 
 if __name__ == "__main__":

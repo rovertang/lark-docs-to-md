@@ -1,6 +1,6 @@
 # lark-docs-to-md
 
-**版本 1.2.0**（见 [`VERSION`](VERSION) 与 [`CHANGELOG.md`](CHANGELOG.md)）。
+**版本 1.2.1**（见 [`VERSION`](VERSION) 与 [`CHANGELOG.md`](CHANGELOG.md)）。
 
 把飞书 / Lark 的 **Docx**、**Wiki** 文档批量导出成本地 **Markdown**（含图片），并用同一个内核提供三种用法：
 
@@ -289,7 +289,7 @@ Markdown 会被规范化：`<title>` 转 H1、`<callout>` 降级为带 emoji 的
 | `1` | 部分失败，或触发 `--max-docs` 提前停止——**不要当作完整归档**，请读 manifest |
 | `2` | URL/参数非法，或输出目录读写失败 |
 
-**警告语义（1.2.0 修正）**：标题读不出来不再是失败。文件名按 `<title>` 元素 → `wiki +node-get` 节点元数据（wiki 文档）→ `drive +inspect` 文档元数据（docx 等，**一次轻量元数据调用，不是整篇重导**）→ 裸 token 的顺序回退，回退文件名为 `<token>.md`（不再带 `docx-`/`wiki-` 前缀），stderr 打印 `[title-fallback]` 并注明标题来源，manifest 记入 `title_fallbacks` / `title_fallback_count`（每条含 `source`：`wiki-node-get` / `drive-inspect` / `token`）。正文为空的文档同理：`[empty]` 打印、记入 `empty_documents` / `empty_count`、`documents[]` 里 `status: "empty"`，退出码仍为 `0`。汇总行形如：
+**警告语义（1.2.0 修正，1.2.1 统一命名）**：标题读不出来不再是失败。文件名按 `<title>` 元素 → `wiki +node-get` 节点元数据（wiki 文档）→ `drive +inspect` 文档元数据（docx 等，**一次轻量元数据调用，不是整篇重导**）→ `未命名-<token[:8]>` 的顺序回退（该占位名与整库导出完全一致，见 1.2.1 的 B4），stderr 打印 `[title-fallback]` 并注明标题来源，manifest 记入 `title_fallbacks` / `title_fallback_count`（每条含 `source`：`wiki-node-get` / `drive-inspect` / `token`）。正文为空的文档同理：`[empty]` 打印、记入 `empty_documents` / `empty_count`、`documents[]` 里 `status: "empty"`，退出码仍为 `0`。汇总行形如：
 
 ```text
 summary: output=... downloaded=N failed=N images=N image_failed=N title_fallback=N empty=N recursive=False limited=False
@@ -314,6 +314,22 @@ summary: output=... downloaded=N failed=N images=N image_failed=N title_fallback
 ```
 
 命名规则：非法字符 `/ \ : * ? " < > |` 与控制字符替换为 `_`，去掉首尾空格和点，长度上限 90 字符；空标题变成 `未命名-<node_token[:8]>`；同目录重名追加 `--<node_token[:10]>`；容器节点自身正文写进 `<目录>/_分类页.md`，因此 `<目录>/` 与 `<目录>.md` 不会同时出现。`_INDEX.md` 的链接使用 CommonMark 尖括号形式 `[标题](<路径>)`，因为真实文件名里含空格和半角 `)`；`_manifest.csv` 写成 UTF-8 **带 BOM**，避免 Excel 打开时中文乱码。
+
+**子表命名（1.2.1 修 B1）**：`sheets +workbook-info` 的真实字段是 `sheet_name`（没有 `title`），
+多子表工作簿导出为 `<文档名>__<子表名>.csv`，例如 `重要负债表__总览.csv`、`公司协议酒店__上海.csv`；
+`nodes[].sheets` 保留 `sheet_id → sheet_name → file` 的完整映射，`_manifest.csv` 的 `sheets` 列也会列出子表名。
+隐藏子表跳过；只有当同名子表真的冲突时才追加 `--<sheet_id[:10]>`。
+
+**文件数与体积口径（1.2.1 修 B2）**：manifest 的 `file_count` / `total_size_bytes` 现在是**磁盘实况**，
+含 docx 节点下载的图片（`assets/<token>/`）与附件原件，并按
+`disk_file_count` / `node_file_count` / `asset_count` / `node_size_bytes` / `asset_size_bytes` 给出拆分；
+每个 docx 节点还有自己的 `asset_count` / `asset_size_bytes`。
+本工具自己的台账文件（`_INDEX.md`、`_failures.md`、`_manifest.*`、`state.json`）不计入，保证数字不随测量时机变化。
+`_INDEX.md` 与 summary 会写成「节点产物 N + 图片等资源 M」两段式，避免把 51.3 MB 的归档误读成 72.3 MB 的缺失。
+
+**断点续传（1.2.1 改进 B3）**：检查点只在带 `--resume` 运行时写入；若 `--resume` 找不到可用 `state.json`
+（不存在或与本轮参数不匹配），会明确提示本次不会跳过任何节点——**失败重跑请从一开始就加 `--resume`**；
+反之若存在 `state.json` 却没加 `--resume`，也会提示本次将重新处理全部节点。
 
 各类型处理方式：`docx` → Markdown + 本地图片（复用 `download_tree()`，不存在第二份下载实现）；`doc`（旧版）→ `GET /open-apis/doc/v2/<obj_token>/raw_content` 纯文本，写成 `<名字>.md` 并在文件顶部显式警告全部格式（加粗、表格、图片、编号）已丢失，manifest 方法为 `legacy-raw-content`；`sheet` → 按可见子表各导出一个 CSV（取自 `data.annotated_csv`，隐藏子表跳过，单子表为 `<名字>.csv`，多子表为 `<名字>__<子表名>.csv`）；`file`（附件）→ `lark-cli drive +download` 取原件，被拒时回退 `drive +preview --list-only` 再按 `--type source_file|pdf|pdf_lin|html` 取预览，`source_file` 命中按真名保存为 `ok`，其他预览存成 `<名字>__preview.pdf` 并记为 `partial` / `fallback: "preview-<type>"`；`bitable`/`mindnote`/`slides`/`whiteboard` 与未知类型记为 `unsupported` 写进 `_failures.md`，不会被静默跳过。
 
@@ -379,12 +395,24 @@ python3 web/lark_download_web.py --port 8765                  # Web 服务
   更新 `description` 后目录热更新生效。
 
 1.2.0 的缺陷修复与新特性由单元测试覆盖（`scripts/test_download_docx_tree.py` 14 项 +
-`scripts/test_download_wiki_space.py` 18 项 = 32 项，`python3 -m unittest discover -s scripts -p "test_*.py"` 全绿），
-包括标题回退（`drive-inspect` / 节点元数据 / 裸 token）、空文档写入但不影响退出码、
-重名子表不互相覆盖、`drive +download` 未落盘判失败、整库导出的命名与 manifest 断言。
+`scripts/test_download_wiki_space.py` 21 项 = 35 项，`python3 -m unittest discover -s scripts -p "test_*.py"` 全绿），
+包括标题回退（`drive-inspect` / 节点元数据 / `未命名-<token[:8]>`）、空文档写入但不影响退出码、
+重名子表不互相覆盖、多子表按 `sheet_name` 命名、`drive +download` 未落盘判失败、
+归档文件数/体积包含图片、`--resume` 能区分「没有检查点」与「无需跳过」、整库导出的命名与 manifest 断言。
+
+**独立验收（用户侧，2026-09-21）**：`公司管理制度`（space `7007715075855450113`，279 节点）全量回归
+与本仓库实现逐位吻合——`ok=172 / partial=103 / empty=2 / failed=2`；图片 136 个、附件 113 个
+做 MD5 多重集比对，**零缺失、零重复**；Markdown 内部链接 409 条、断链 0；16 篇旧版 doc 全部
+`legacy-raw-content` 成功；8 子表工作簿、`--flat`、`--attachments skip/preview`、`--max-nodes`、
+退出码契约（含失败子树 → `EXIT=1`）逐项通过。该报告提出的 5 个问题已在 1.2.1 修复。
+
+1.2.1 本机复核：真实 8 子表工作簿（`重要负债表`、`资产核算表`）导出为
+`重要负债表__总览.csv` 等可读名并带 `sheets` 映射；归档统计与 `find`/`du` 口径一致（排除台账文件）；
+`--resume` 首跑给出「未找到可用的 state.json」提示、二跑正确「跳过 5 个已完成节点」。
 
 仍有限制：本机登录缺少旧版 `doc` 的 `raw_content` scope（`missing_scope`），
-因此**旧版 doc 的纯文本导出只做了 mock 测试**，未在本环境真实跑通；用它之前先确认 scope 已授权。
+因此**旧版 doc 的纯文本导出在本环境只有 mock 测试覆盖**（用户侧账号已真实跑通 16/16）；
+本机可访问的知识库里没有带图片的 wiki 空间，图片计入统计这部分由单元测试覆盖。
 
 ## License
 

@@ -35,10 +35,11 @@ Rules:
   `lark-cli wiki +node-get --node-token <token>` for the node title, then every
   document type asks `lark-cli drive +inspect --url <url>` for the document title
   (metadata only - the old "re-export the whole document as XML" call is gone),
-  and only then falls back to the bare token. A fallback name is `<token>.md` -
-  there is no `docx-` or `wiki-` type prefix, because the manifest already records
-  the type. The reason is recorded in `title_fallbacks` (with `source` =
-  `wiki-node-get`, `drive-inspect` or `token`), logged as `[title-fallback]` on
+  and only then falls back to `未命名-<token[:8]>` - the same readable placeholder
+  the space exporter uses, so both entry points name an untitled document
+  identically. There is no `docx-` or `wiki-` type prefix, because the manifest
+  already records the type. The reason is recorded in `title_fallbacks` (with
+  `source` = `wiki-node-get`, `drive-inspect` or `token`), logged as `[title-fallback]` on
   stderr, and **never** changes the exit code: the file is written either way. On a later
   successful run the fallback file is deleted.
 - A document whose exported body is blank (`content.strip() == ""`) is written
@@ -159,6 +160,11 @@ Naming and layout rules:
 - `_manifest.csv` is UTF-8 **with BOM**; without it Excel garbles Chinese.
 - `--resume` reuses `state.json` and skips nodes already recorded as `ok`,
   `empty`, `unsupported`, or `skipped`; `failed` and `partial` nodes are retried.
+  Checkpoints are only written while `--resume` is active, so a run that must be
+  resumable has to start with `--resume`. When `--resume` finds no usable
+  `state.json` (missing, or written with different options) it says so explicitly
+  instead of silently reprocessing everything; the reverse case (a checkpoint
+  exists but `--resume` was omitted) is flagged too.
 - `--workers` defaults to 4. The Feishu API rate-limits higher concurrency and it
   shows up as intermittent, non-reproducible node failures.
 
@@ -168,7 +174,7 @@ Per node type:
 | --- | --- | --- |
 | `docx` | `docs-fetch-markdown` | Markdown plus local images, reusing `download_tree()` with `group_assets=True` |
 | `doc` (legacy) | `legacy-raw-content` | Plain text from `GET /open-apis/doc/v2/<obj_token>/raw_content`, written as `<name>.md` with an explicit warning block that all formatting is lost |
-| `sheet` | `sheets-csv` | One CSV per visible sub-sheet from `data.annotated_csv`; hidden sub-sheets are skipped. One sub-sheet is `<name>.csv`, several are `<name>__<sheet title>.csv` |
+| `sheet` | `sheets-csv` | One CSV per visible sub-sheet from `data.annotated_csv`; hidden sub-sheets are skipped. One sub-sheet is `<name>.csv`; several are `<name>__<sheet name>.csv`, where the sheet name comes from the real `sheet_name` field of `sheets +workbook-info` (`title` does not exist in that payload), and the `sheet_id -> sheet_name -> file` mapping is kept in `nodes[].sheets` |
 | `file` | `drive-download`, `preview-source_file`, `preview-<type>` | The attachment; original first, preview fallback |
 | anything else | `none` | Recorded as `unsupported` in `_failures.md`, never silently skipped |
 
@@ -188,12 +194,16 @@ the working directory set to the target folder and passes `./<name>`.
 
 | Field | Meaning |
 | --- | --- |
-| `version` | Exporter version, `1.2.0` |
+| `version` | Exporter version, `1.2.1` |
 | `space_id`, `space_name`, `root_node_token` | What was exported |
 | `output_dir`, `generated_at` | Where and when |
 | `flat`, `attachments`, `identity` | The effective options |
 | `complete` | True when no node failed and the walk was not truncated |
-| `total_nodes`, `file_count`, `total_size_bytes` | Totals |
+| `total_nodes` | Number of walked nodes |
+| `file_count`, `total_size_bytes` | **Archive totals measured on disk**: node products + images + attachments. The exporter's own bookkeeping (`_INDEX.md`, `_failures.md`, `_manifest.*`, `state.json`) is excluded so the numbers do not depend on when they were measured |
+| `disk_file_count`, `disk_size_bytes` | Same values as `file_count` / `total_size_bytes`, spelled out explicitly |
+| `node_file_count`, `node_size_bytes` | Only the nodes' own products (the pre-1.2.1 meaning of `file_count` / `total_size_bytes`, before images were counted) |
+| `asset_count`, `asset_size_bytes` | Images and other files under `assets/<token>/` |
 | `counts` | Per status: `ok`, `partial`, `empty`, `failed`, `unsupported`, `skipped` |
 | `limited` | `--max-nodes` stopped the walk early |
 | `issues` | Walk-level problems (unreadable subtrees, the cap being hit) |
@@ -201,9 +211,14 @@ the working directory set to the target folder and passes `./<name>`.
 
 Every `nodes[]` entry has `node_token`, `obj_token`, `obj_type`, `title`,
 `path` (array of directory names), `depth`, `is_container`, `status`, `method`,
-`local_file`, `size_bytes`, `images`, `detail`, `url`. A previewed attachment
-adds `fallback` and `preview_type`; a multi-sheet workbook adds `files` (every
-written CSV path, with `local_file` pointing at the first).
+`format` (`markdown` / `text` / `csv` / the attachment suffix / the preview type),
+`local_file`, `size_bytes`, `asset_count`, `asset_size_bytes`, `images`, `detail`,
+`url`. A previewed attachment adds `fallback` and `preview_type`; a multi-sheet
+workbook adds `files` (every written CSV path, with `local_file` pointing at the
+first) and `sheets` (`[{sheet_id, sheet_name, file}]`).
+
+`_manifest.csv` carries the same data with one row per node, including the
+`format`, `asset_count`, `asset_size_bytes` and `sheets` columns.
 
 Exit codes: `0` when no node failed, `1` when at least one node failed or
 `--max-nodes` stopped the walk early, `2` for invalid arguments or when nothing

@@ -346,6 +346,8 @@ def finalize_space_item(item: JobItem, exit_code: int, output_root: Path) -> Non
     item.downloaded = int(counts.get("ok", 0))
     item.failed = int(counts.get("failed", 0))
     item.empty = int(counts.get("empty", 0))
+    # `assets/` holds the images downloaded for docx nodes
+    item.images = int(manifest.get("asset_count", 0))
     item.titles = [str(manifest.get("space_name") or item.token)]
     item.output_dir = str(space_dir) if space_dir else None
     partial = int(counts.get("partial", 0))

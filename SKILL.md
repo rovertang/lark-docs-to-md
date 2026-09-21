@@ -3,7 +3,7 @@ name: lark-docs-to-md
 description: "Download Feishu/Lark Docx or Wiki documents as offline Markdown with local images - single URL, URL-list batch, recursive child documents, or a whole wiki space (knowledge base) with legacy docs, spreadsheets and attachments. Includes a local web UI. Use when given feishu.cn / larksuite.com /docx/ or /wiki/ URLs or a wiki space id and asked to download, archive, export or mirror them, including 批量下载飞书文档, 导出飞书知识库, 递归下载子文档, 下载文档图片. Not for Base, mindnotes, slides or whiteboards."
 metadata:
   short-description: "Export Lark Docx/Wiki documents to offline Markdown"
-  version: "1.2.0"
+  version: "1.2.1"
 license: MIT
 ---
 
@@ -79,7 +79,12 @@ API failures), `--resume` (reuse `state.json` and skip finished nodes),
 The space export writes `<output-dir>/<space name>/` with `_INDEX.md` (tree plus
 status badges), `_failures.md` (failed / degraded / empty / unsupported /
 skipped), `_manifest.json`, `_manifest.csv` (UTF-8 with BOM, so Excel opens
-Chinese correctly) and `state.json` when `--resume` is used.
+Chinese correctly) and `state.json` when `--resume` is used. Multi-sheet
+workbooks become one CSV per visible sub-sheet named after the sub-sheet
+(`<doc>__<sheet name>.csv`, with the `sheet_id -> sheet_name -> file` mapping kept
+in `nodes[].sheets`); the reported file counts and sizes cover images and
+attachments, not just the node products. `--resume` without an existing
+`state.json` cannot skip anything and now says so explicitly.
 
 Web UI, when the user prefers a browser and wants to click through the download.
 It offers both modes - a list of document URLs, or one whole wiki space by
@@ -110,7 +115,8 @@ Useful options: `--retries N` (default 2), `--timeout SECONDS` (default 120),
 - Exit code `0` means complete, `1` means incomplete, `2` means invalid input.
   Treat images that failed as incomplete output.
 - Warnings never change the exit code. A document whose title could not be read
-  is written under a fallback name (`<token>.md`) and logged as `[title-fallback]`;
+  is written under a fallback name (`未命名-<token[:8]>`, the same placeholder the
+  space exporter uses) and logged as `[title-fallback]`;
   the title is rescued first from the wiki node (`wiki +node-get`) and then from
   `drive +inspect`, and `title_fallbacks[].source` records which one worked. A
   document whose exported body is blank is logged as `[empty]`. Both are recorded

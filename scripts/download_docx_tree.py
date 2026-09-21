@@ -524,6 +524,16 @@ def fetch_drive_document_title(
     return None, "drive +inspect response has no title"
 
 
+def fallback_document_name(token: str) -> str:
+    """Human-readable file stem used when a document has no usable title.
+
+    Shared with `download_wiki_space.py` so the same untitled document gets the
+    same file name from either entry point: `未命名-<token[:8]>` rather than a bare
+    token that looks like a machine artefact.
+    """
+    return f"未命名-{token[:8]}"
+
+
 def fallback_document_title(
     ref: DocRef,
     *,
@@ -534,9 +544,9 @@ def fallback_document_title(
     """Single title-fallback path, returning (title, error, source).
 
     Order: the wiki node's own title (cheapest, and the name the user sees in the
-    knowledge base), then `drive +inspect` document metadata, then the bare token.
-    The result never carries a `docx-`/`wiki-` type prefix - the manifest already
-    records the document type - so a fallback file is named `<token>.md`.
+    knowledge base), then `drive +inspect` document metadata, then a readable
+    `未命名-<token[:8]>` placeholder. The result never carries a `docx-`/`wiki-`
+    type prefix - the manifest already records the document type.
     """
     errors: list[str] = []
     if ref.kind == "wiki":
@@ -552,7 +562,7 @@ def fallback_document_title(
     if title:
         return title, None, "drive-inspect"
     errors.append(error or "drive +inspect has no title")
-    return ref.token, "；".join(errors), "token"
+    return fallback_document_name(ref.token), "；".join(errors), "token"
 
 
 def safe_filename(title: str) -> str:
@@ -1271,7 +1281,7 @@ def download_tree(
         )
         destination = output_dir / filename
         atomic_write_text(destination, content)
-        fallback_destination = output_dir / safe_filename(ref.token)
+        fallback_destination = output_dir / safe_filename(fallback_document_name(ref.token))
         if fallback_destination != destination:
             fallback_destination.unlink(missing_ok=True)
 
@@ -1313,6 +1323,7 @@ def download_tree(
                 "url": ref.url,
                 "title": title,
                 "file": filename,
+                "format": "markdown",
                 "status": "empty" if is_empty else "ok",
                 "empty": is_empty,
                 "title_fallback": title_is_fallback,
